@@ -1,4 +1,6 @@
 
+"use strict";
+
 const { randomBytes, createHash } = require("node:crypto");
 const db = require("./database");
 
@@ -17,14 +19,12 @@ const cookieOptions = {
     path: "/"
 };
 
-// Transformam tokenul intr-un hash
 function hashToken(token) {
     return createHash("sha256")
         .update(token)
         .digest("hex");
 }
 
-// Cream o sesiune dupa login
 function createSession(userId, res) {
     const token = randomBytes(32).toString("hex");
     const tokenHash = hashToken(token);
@@ -41,15 +41,13 @@ function createSession(userId, res) {
     });
 }
 
-// Verificam daca utilizatorul este autentificat
-function requireAuth(req, res, next) {
-    const token = req.cookies?.[COOKIE_NAME];
-
-    if (typeof token !== "string" ||
-        !/^[a-f0-9]{64}$/.test(token)) {
-        return res.status(401).json({
-            error: "Authentication required"
-        });
+// Shared session validation for HTTP and WebSocket.
+function authenticateToken(token) {
+    if (
+        typeof token !== "string" ||
+        !/^[a-f0-9]{64}$/.test(token)
+    ) {
+        return null;
     }
 
     const tokenHash = hashToken(token);
@@ -63,22 +61,73 @@ function requireAuth(req, res, next) {
     `).get(tokenHash, Date.now());
 
     if (!user) {
+        return null;
+    }
+
+    return { user, tokenHash };
+}
+
+function requireAuth(req, res, next) {
+    const session = authenticateToken(
+        req.cookies?.[COOKIE_NAME]
+    );
+
+    if (!session) {
         return res.status(401).json({
-            error: "Invalid or expired session"
+            error: "Authentication required"
         });
     }
 
-    req.user = user;
-    req.sessionTokenHash = tokenHash;
+    req.user = session.user;
+    req.sessionTokenHash = session.tokenHash;
 
     next();
 }
 
-// Inchidem sesiunea la logout
+// Read the existing session cookie from a WebSocket handshake.
+function authenticateCookieHeader(cookieHeader) {
+    if (
+        typeof cookieHeader !== "string" ||
+        cookieHeader.length > 8192
+    ) {
+        return null;
+    }
+
+    const prefix = COOKIE_NAME + "=";
+
+    const tokens = cookieHeader
+        .split(";")
+        .map(part => part.trim())
+        .filter(part => part.startsWith(prefix))
+        .map(part => part.slice(prefix.length));
+
+    // Reject ambiguous duplicate session cookies.
+    if (tokens.length !== 1) {
+        return null;
+    }
+
+    return authenticateToken(tokens[0]);
+}
+
+// Recheck sessions after WebSocket authentication.
+// Logout or expiry invalidates further notifications.
+function isSessionActive(userId, tokenHash) {
+    const row = db.prepare(`
+        SELECT 1 AS valid
+        FROM sessions
+        WHERE token_hash = ?
+          AND user_id = ?
+          AND expires_at > ?
+    `).get(tokenHash, userId, Date.now());
+
+    return Boolean(row);
+}
+
 function destroySession(req, res) {
-    db.prepare(
-        "DELETE FROM sessions WHERE token_hash = ?"
-    ).run(req.sessionTokenHash);
+    db.prepare(`
+        DELETE FROM sessions
+        WHERE token_hash = ?
+    `).run(req.sessionTokenHash);
 
     res.clearCookie(COOKIE_NAME, cookieOptions);
 }
@@ -86,5 +135,7 @@ function destroySession(req, res) {
 module.exports = {
     createSession,
     requireAuth,
-    destroySession
+    destroySession,
+    authenticateCookieHeader,
+    isSessionActive
 };

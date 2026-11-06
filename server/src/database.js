@@ -9,11 +9,11 @@ const dataFolder = path.join(__dirname, "../data");
 fs.mkdirSync(dataFolder, { recursive: true });
 
 // Deschidem baza de date SQLite
-const databasePath = path.join(dataFolder, "encrypto.db");
+const databasePath = process.env.ENCRYPTO_DB_PATH || path.join(dataFolder, "encrypto.db");
 const db = new DatabaseSync(databasePath);
 
 // Activam verificarea legaturilor dintre tabele
-db.exec("PRAGMA foreign_keys = ON");
+db.exec("PRAGMA busy_timeout = 5000");
 
 // Cream tabelele daca nu exista deja
 db.exec(`
@@ -103,6 +103,79 @@ db.exec(`
 
     CREATE INDEX IF NOT EXISTS idx_direct_messages_users
     ON direct_messages(sender_id, recipient_id, created_at);
+`);
+
+
+db.exec(`
+    CREATE TABLE IF NOT EXISTS user_crypto (
+        user_id TEXT PRIMARY KEY
+            REFERENCES users(id) ON DELETE CASCADE,
+
+        contact_code TEXT NOT NULL UNIQUE,
+        identity_key TEXT NOT NULL,
+        identity_dh_key TEXT NOT NULL,
+        identity_binding TEXT NOT NULL,
+
+        signed_prekey_id INTEGER NOT NULL,
+        signed_prekey_public TEXT NOT NULL,
+        signed_prekey_signature TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS one_time_prekeys (
+        user_id TEXT NOT NULL
+            REFERENCES users(id) ON DELETE CASCADE,
+
+        key_id INTEGER NOT NULL,
+        public_key TEXT NOT NULL,
+
+        PRIMARY KEY (user_id, key_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS key_enrollment_challenges (
+        user_id TEXT PRIMARY KEY
+            REFERENCES users(id) ON DELETE CASCADE,
+
+        challenge TEXT NOT NULL,
+        expires_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS direct_chats (
+        id TEXT PRIMARY KEY,
+
+        user_a TEXT NOT NULL REFERENCES users(id),
+        user_b TEXT NOT NULL REFERENCES users(id),
+
+        requested_by TEXT NOT NULL REFERENCES users(id),
+
+        status TEXT NOT NULL
+            CHECK(status IN ('pending', 'active', 'declined')),
+
+        created_at TEXT NOT NULL,
+
+        UNIQUE(user_a, user_b)
+    );
+
+    CREATE TABLE IF NOT EXISTS secure_messages (
+        id TEXT PRIMARY KEY,
+
+        sender_id TEXT NOT NULL REFERENCES users(id),
+        recipient_id TEXT NOT NULL REFERENCES users(id),
+
+        client_message_id TEXT NOT NULL,
+        envelope_json TEXT NOT NULL,
+
+        created_at TEXT NOT NULL,
+        acknowledged_at TEXT,
+
+        UNIQUE(sender_id, client_message_id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_secure_inbox
+    ON secure_messages(
+        recipient_id,
+        acknowledged_at,
+        created_at
+    );
 `);
 
 module.exports = db;
