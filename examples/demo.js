@@ -1,6 +1,6 @@
 /**
  * End-to-end walkthrough: sign-up, adding a contact by code, messaging, an encrypted
- * attachment, and recovering a forgotten-password account with the recovery key.
+ * attachment, recovering a forgotten-password account with the recovery key, and a chat password.
  *
  * DemoServer stands in for your backend. Notice that it only ever stores public keys and
  * ciphertext: it has nothing it could decrypt messages with.
@@ -111,4 +111,22 @@ server.send(restoredAlice.contactCode, bobCode, await restoredAlice.encrypt(bobC
 await deliver(server, bob);
 server.send(bob.contactCode, restoredAlice.contactCode, await bob.encrypt(restoredAlice.contactCode, 'Welcome back!'));
 await deliver(server, restoredAlice);
+
+console.log('\n6. Bob puts a chat password on his chat with Alice (separate from his login password)');
+await bob.setChatPassword(alice.contactCode, 'our-secret-chat');
+await bob.lockChat(alice.contactCode);
+server.send(restoredAlice.contactCode, bobCode, await restoredAlice.encrypt(bobCode, 'Can you read this?'));
+const waiting = server.receive(bobCode);
+try {
+  await bob.decrypt(waiting[0].from, waiting[0].envelope);
+} catch (error) {
+  console.log(`  ${error.name}: the message stays encrypted until Bob unlocks the chat`);
+}
+try {
+  await bob.unlockChat(alice.contactCode, 'wrong-guess');
+} catch (error) {
+  console.log(`  ${error.name}: unlocking with a wrong password fails`);
+}
+await bob.unlockChat(alice.contactCode, 'our-secret-chat');
+for (const { from, envelope } of waiting) console.log(`  after unlocking: "${await bob.decrypt(from, envelope)}"`);
 console.log('\nDone.');

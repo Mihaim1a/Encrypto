@@ -1,7 +1,8 @@
 /**
  * End-to-end encryption for the messenger: X3DH key agreement + Double Ratchet + AES-256-GCM.
  *
- * Client side:  Account, encryptAttachment, decryptAttachment, normalizeContactCode
+ * Client side:  Account (incl. per-chat passwords), encryptAttachment, decryptAttachment,
+ *               normalizeContactCode, validateChatPassword
  * Server side:  createRecoveryChallenge, verifyRecoveryChallenge (the server never decrypts anything)
  */
 import { fromBase64, toBase64 } from './encoding.js';
@@ -10,8 +11,10 @@ import { randomBytes } from './primitives.js';
 
 export { Account, NoSessionError } from './account.js';
 export { encryptAttachment, decryptAttachment } from './attachments.js';
+export { CHAT_PASSWORD_MIN_LENGTH, ChatLockedError, WrongPasswordError, validateChatPassword } from './chat-lock.js';
 export { InvalidCodeError } from './keys.js';
 export { DecryptionError, PROTOCOL } from './primitives.js';
+export { InvalidStateError, PersistenceError } from './state.js';
 export { UntrustedIdentityError } from './x3dh.js';
 
 /**
