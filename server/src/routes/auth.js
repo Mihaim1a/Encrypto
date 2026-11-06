@@ -1,4 +1,6 @@
 
+"use strict";
+
 const express = require("express");
 const {
     randomUUID,
@@ -21,7 +23,7 @@ const {
 const router = express.Router();
 const scryptAsync = promisify(scrypt);
 
-// Limitam incercarile de autentificare
+// Limit login attempts.
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
     limit: 10,
@@ -33,11 +35,22 @@ const loginLimiter = rateLimit({
     }
 });
 
+// Limit registration attempts.
+const registerLimiter = rateLimit({
+    windowMs: 15 * 60 * 1000,
+    limit: 20,
+    standardHeaders: "draft-7",
+    legacyHeaders: false,
+    message: {
+        error: "Too many registration attempts"
+    }
+});
+
 // REGISTER
-router.post("/register", async (req, res) => {
+router.post("/register", registerLimiter, async (req, res) => {
     const { username, email, password, publicKey } = req.body || {};
 
-    // Validam datele primite
+    // Validate registration data.
     if (
         typeof username !== "string" ||
         !/^[a-zA-Z0-9_]{3,30}$/.test(username) ||
@@ -60,7 +73,7 @@ router.post("/register", async (req, res) => {
     const cleanUsername = username.toLowerCase();
 
     try {
-        // Verificam daca utilizatorul exista
+        // Check whether username or email already exists.
         const existing = db.prepare(
             "SELECT id FROM users WHERE email = ? OR username = ?"
         ).get(cleanEmail, cleanUsername);
@@ -71,7 +84,7 @@ router.post("/register", async (req, res) => {
             });
         }
 
-        // Generam salt si hash-uim parola
+        // Generate a unique salt and hash the password.
         const salt = randomBytes(16).toString("hex");
 
         const hash = await scryptAsync(password, salt, 64, {
@@ -84,14 +97,20 @@ router.post("/register", async (req, res) => {
         const passwordHash =
             `scrypt$131072$8$1$${salt}$${hash.toString("hex")}`;
 
-        // Salvam utilizatorul
+        // Store the user.
         const id = randomUUID();
 
         db.prepare(`
             INSERT INTO users
             (id, username, email, password_hash, public_key)
             VALUES (?, ?, ?, ?, ?)
-        `).run(id, cleanUsername, cleanEmail, passwordHash, publicKey);
+        `).run(
+            id,
+            cleanUsername,
+            cleanEmail,
+            passwordHash,
+            publicKey
+        );
 
         return res.status(201).json({
             message: "User registered successfully",
@@ -103,7 +122,11 @@ router.post("/register", async (req, res) => {
         });
 
     } catch (error) {
-        if (String(error.message).includes("UNIQUE constraint failed")) {
+        if (
+            String(error.message).includes(
+                "UNIQUE constraint failed"
+            )
+        ) {
             return res.status(409).json({
                 error: "Username or email already exists"
             });
@@ -117,7 +140,7 @@ router.post("/register", async (req, res) => {
     }
 });
 
-// Verificam parola folosind hash-ul salvat
+// Verify a password using the stored scrypt hash.
 async function verifyPassword(password, savedHash) {
     if (typeof savedHash !== "string") {
         return false;
@@ -159,7 +182,7 @@ async function verifyPassword(password, savedHash) {
 router.post("/login", loginLimiter, async (req, res) => {
     const { email, password } = req.body || {};
 
-    // Validam datele introduse
+    // Validate login data.
     if (
         typeof email !== "string" ||
         typeof password !== "string" ||
@@ -174,21 +197,24 @@ router.post("/login", loginLimiter, async (req, res) => {
     }
 
     try {
-        // Cautam utilizatorul dupa email
+        // Find the user by email.
         const user = db.prepare(`
-            SELECT id, username, email, password_hash
+            SELECT
+                id,
+                username,
+                email,
+                password_hash
             FROM users
             WHERE email = ?
         `).get(email.trim().toLowerCase());
 
-        // Hash fictiv pentru a reduce diferentele
-        // de timp cand utilizatorul nu exista
+        // Use a dummy hash for nonexistent accounts
+        // to reduce timing differences.
         const dummyHash =
             "scrypt$131072$8$1$" +
             "0".repeat(32) + "$" +
             "0".repeat(128);
 
-        // Verificam parola
         const validPassword = await verifyPassword(
             password,
             user ? user.password_hash : dummyHash
@@ -200,7 +226,7 @@ router.post("/login", loginLimiter, async (req, res) => {
             });
         }
 
-        // Cream sesiunea utilizatorului
+        // Create the authenticated session.
         createSession(user.id, res);
 
         res.set("Cache-Control", "no-store");
