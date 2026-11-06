@@ -23,6 +23,55 @@ const {
 const router = express.Router();
 const scryptAsync = promisify(scrypt);
 
+const SCRYPT_OPTIONS = {
+    N: 131072,
+    r: 8,
+    p: 1,
+    maxmem: 256 * 1024 * 1024
+};
+
+const MAX_CONCURRENT_PASSWORD_HASHES = 2;
+let activePasswordHashes = 0;
+
+// Limit concurrent password hashing across login and registration.
+async function boundedScrypt(password, salt) {
+    if (activePasswordHashes >= MAX_CONCURRENT_PASSWORD_HASHES) {
+        const error = new Error("Password hashing capacity reached");
+        error.code = "AUTH_BUSY";
+        throw error;
+    }
+
+    activePasswordHashes++;
+
+    try {
+        return await scryptAsync(
+            password,
+            salt,
+            64,
+            SCRYPT_OPTIONS
+        );
+    } finally {
+        activePasswordHashes--;
+    }
+}
+
+function handleAuthError(error, res, context) {
+    if (error.code === "AUTH_BUSY") {
+        res.set("Retry-After", "2");
+        res.set("Cache-Control", "no-store");
+
+        return res.status(503).json({
+            error: "Authentication temporarily unavailable"
+        });
+    }
+
+    console.error(`${context} error:`, error);
+
+    return res.status(500).json({
+        error: "Internal server error"
+    });
+}
+
 // Limit login attempts.
 const loginLimiter = rateLimit({
     windowMs: 15 * 60 * 1000,
@@ -50,7 +99,6 @@ const registerLimiter = rateLimit({
 router.post("/register", registerLimiter, async (req, res) => {
     const { username, email, password, publicKey } = req.body || {};
 
-    // Validate registration data.
     if (
         typeof username !== "string" ||
         !/^[a-zA-Z0-9_]{3,30}$/.test(username) ||
@@ -73,10 +121,11 @@ router.post("/register", registerLimiter, async (req, res) => {
     const cleanUsername = username.toLowerCase();
 
     try {
-        // Check whether username or email already exists.
-        const existing = db.prepare(
-            "SELECT id FROM users WHERE email = ? OR username = ?"
-        ).get(cleanEmail, cleanUsername);
+        const existing = db.prepare(`
+            SELECT id
+            FROM users
+            WHERE email = ? OR username = ?
+        `).get(cleanEmail, cleanUsername);
 
         if (existing) {
             return res.status(409).json({
@@ -84,20 +133,13 @@ router.post("/register", registerLimiter, async (req, res) => {
             });
         }
 
-        // Generate a unique salt and hash the password.
         const salt = randomBytes(16).toString("hex");
 
-        const hash = await scryptAsync(password, salt, 64, {
-            N: 131072,
-            r: 8,
-            p: 1,
-            maxmem: 256 * 1024 * 1024
-        });
+        const hash = await boundedScrypt(password, salt);
 
         const passwordHash =
             `scrypt$131072$8$1$${salt}$${hash.toString("hex")}`;
 
-        // Store the user.
         const id = randomUUID();
 
         db.prepare(`
@@ -132,15 +174,11 @@ router.post("/register", registerLimiter, async (req, res) => {
             });
         }
 
-        console.error("Registration error:", error);
-
-        return res.status(500).json({
-            error: "Internal server error"
-        });
+        return handleAuthError(error, res, "Registration");
     }
 });
 
-// Verify a password using the stored scrypt hash.
+// Verify passwords using the stored scrypt hash.
 async function verifyPassword(password, savedHash) {
     if (typeof savedHash !== "string") {
         return false;
@@ -165,12 +203,7 @@ async function verifyPassword(password, savedHash) {
         return false;
     }
 
-    const calculated = await scryptAsync(password, salt, 64, {
-        N: 131072,
-        r: 8,
-        p: 1,
-        maxmem: 256 * 1024 * 1024
-    });
+    const calculated = await boundedScrypt(password, salt);
 
     return timingSafeEqual(
         calculated,
@@ -182,7 +215,6 @@ async function verifyPassword(password, savedHash) {
 router.post("/login", loginLimiter, async (req, res) => {
     const { email, password } = req.body || {};
 
-    // Validate login data.
     if (
         typeof email !== "string" ||
         typeof password !== "string" ||
@@ -197,19 +229,12 @@ router.post("/login", loginLimiter, async (req, res) => {
     }
 
     try {
-        // Find the user by email.
         const user = db.prepare(`
-            SELECT
-                id,
-                username,
-                email,
-                password_hash
+            SELECT id, username, email, password_hash
             FROM users
             WHERE email = ?
         `).get(email.trim().toLowerCase());
 
-        // Use a dummy hash for nonexistent accounts
-        // to reduce timing differences.
         const dummyHash =
             "scrypt$131072$8$1$" +
             "0".repeat(32) + "$" +
@@ -226,7 +251,6 @@ router.post("/login", loginLimiter, async (req, res) => {
             });
         }
 
-        // Create the authenticated session.
         createSession(user.id, res);
 
         res.set("Cache-Control", "no-store");
@@ -241,11 +265,7 @@ router.post("/login", loginLimiter, async (req, res) => {
         });
 
     } catch (error) {
-        console.error("Login error:", error);
-
-        return res.status(500).json({
-            error: "Internal server error"
-        });
+        return handleAuthError(error, res, "Login");
     }
 });
 
