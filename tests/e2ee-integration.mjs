@@ -757,6 +757,58 @@ async function main() {
     console.log("IDOR SECURITY TESTS PASSED!");
 
     // =====================================================
+    // TEST 26 - X3DH PREKEY EXHAUSTION PROTECTION
+    // =====================================================
+
+    console.log("26. Testing unauthorized prekey access...");
+
+    const bobKeysBefore = await api(
+        "GET",
+        "/api/keys/status",
+        undefined,
+        bob.cookie
+    );
+
+    // Charlie has no active chat with Bob.
+    const unauthorizedBundle = await fetch(
+        `${BASE_URL}/api/keys/bundle`,
+        {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/json",
+                Cookie: charlie.cookie
+            },
+            body: JSON.stringify({
+                contactCode: bob.account.contactCode
+            })
+        }
+    );
+
+    assert.equal(
+        unauthorizedBundle.status,
+        404,
+        "Unauthorized bundle request was not blocked"
+    );
+
+    console.log("Unauthorized X3DH bundle access: BLOCKED");
+
+    const bobKeysAfter = await api(
+        "GET",
+        "/api/keys/status",
+        undefined,
+        bob.cookie
+    );
+
+    assert.equal(
+        bobKeysAfter.data.oneTimePreKeys,
+        bobKeysBefore.data.oneTimePreKeys,
+        "Unauthorized request consumed Bob's prekeys"
+    );
+
+    console.log("Bob's one-time prekeys preserved: PASSED");
+    console.log("PREKEY ACCESS SECURITY TESTS PASSED!");
+
+    // =====================================================
     // TEST 23 - OPEN WEBSOCKET BEFORE LOGOUT
     // =====================================================
 

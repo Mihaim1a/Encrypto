@@ -354,6 +354,33 @@ router.post("/bundle", async (req, res) => {
             });
         }
 
+        // Only active chat participants may retrieve a user's prekeys.
+        const authorizedChat = db.prepare(`
+            SELECT 1 AS allowed
+            FROM direct_chats
+            WHERE status = 'active'
+              AND (
+                  (user_a = ? AND user_b = ?)
+                  OR
+                  (user_a = ? AND user_b = ?)
+              )
+            LIMIT 1
+        `).get(
+            req.user.id,
+            identity.user_id,
+            identity.user_id,
+            req.user.id
+        );
+
+        if (!authorizedChat) {
+            db.exec("ROLLBACK");
+            inTransaction = false;
+
+            return res.status(404).json({
+                error: "Public identity not found or unavailable"
+            });
+        }
+
         const prekey = db.prepare(`
             SELECT key_id, public_key
             FROM one_time_prekeys
