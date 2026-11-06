@@ -72,4 +72,21 @@ db.exec(`
 
 console.log("Encrypto database initialized!");
 
+
+db.exec(`
+    CREATE TABLE IF NOT EXISTS sessions (
+        token_hash TEXT PRIMARY KEY,
+        user_id TEXT NOT NULL,
+        expires_at INTEGER NOT NULL,
+        created_at TEXT DEFAULT CURRENT_TIMESTAMP,
+        FOREIGN KEY (user_id) REFERENCES users(id)
+            ON DELETE CASCADE
+    );
+`);
+
+// Stergem sesiunile deja expirate la pornire
+db.prepare(
+    "DELETE FROM sessions WHERE expires_at <= ?"
+).run(Date.now());
+
 module.exports = db;
