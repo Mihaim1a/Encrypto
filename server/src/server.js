@@ -5,6 +5,7 @@ const express = require("express");
 const cookieParser = require("cookie-parser");
 const helmet = require("helmet");
 const http = require("node:http");
+const path = require("node:path");
 
 const { setupRealtime } = require("./realtime");
 const { enforceOrigin } = require("./security");
@@ -116,6 +117,16 @@ function runMaintenance() {
         );
     }
 }
+
+const frontendFile = path.resolve(
+    __dirname,
+    "../../frontend.html"
+);
+
+// Serve the Encrypto website from the same origin as the API.
+app.get("/", (req, res) => {
+    res.sendFile(frontendFile);
+});
 
 // Create the HTTP server.
 const server = http.createServer(app);
