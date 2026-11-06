@@ -2,7 +2,7 @@
 "use strict";
 
 const express = require("express");
-const { randomUUID } = require("node:crypto");
+const { randomUUID, createHash } = require("node:crypto");
 const { rateLimit } = require("express-rate-limit");
 const { notifyMessageAvailable } = require("../realtime");
 
@@ -11,14 +11,18 @@ const { requireAuth } = require("../session");
 
 const router = express.Router();
 
+const MESSAGE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
 const UUID_PATTERN =
     /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
 const BASE64_PATTERN =
     /^(?:[A-Za-z0-9+/]{4})*(?:[A-Za-z0-9+/]{2}==|[A-Za-z0-9+/]{3}=)?$/;
 
+// Authentication required for all secure message routes.
 router.use(requireAuth);
 
+// Limit requests to reduce API abuse.
 router.use(rateLimit({
     windowMs: 60 * 1000,
     limit: 60,
@@ -26,6 +30,7 @@ router.use(rateLimit({
     legacyHeaders: false
 }));
 
+// Prevent private API responses from being cached.
 router.use((req, res, next) => {
     res.set("Cache-Control", "no-store");
     next();
@@ -57,7 +62,6 @@ function isValidEnvelope(envelope) {
         return false;
     }
 
-    // Encrypted envelope only.
     if (
         envelope.version !== 1 ||
         !["prekey", "message"].includes(envelope.type) ||
@@ -69,14 +73,16 @@ function isValidEnvelope(envelope) {
 
     if (
         envelope.type === "prekey" &&
-        (!envelope.preKey ||
+        (
+            !envelope.preKey ||
             typeof envelope.preKey !== "object" ||
-            Array.isArray(envelope.preKey))
+            Array.isArray(envelope.preKey)
+        )
     ) {
         return false;
     }
 
-    // Never accept obvious plaintext/private-key fields.
+    // Reject obvious plaintext or private-key fields.
     const forbidden = [
         "plaintext",
         "messageText",
@@ -93,8 +99,16 @@ function isValidEnvelope(envelope) {
     }
 
     return Buffer.byteLength(
-        JSON.stringify(envelope), "utf8"
+        JSON.stringify(envelope),
+        "utf8"
     ) <= 12000;
+}
+
+// Calculate a fingerprint for duplicate-message detection.
+function hashEnvelope(serializedEnvelope) {
+    return createHash("sha256")
+        .update(serializedEnvelope, "utf8")
+        .digest("hex");
 }
 
 // Send an encrypted envelope to an active chat.
@@ -115,6 +129,7 @@ router.post("/", (req, res) => {
         });
     }
 
+    // Verify the sender belongs to this active chat.
     const chat = db.prepare(`
         SELECT user_a, user_b
         FROM direct_chats
@@ -135,18 +150,31 @@ router.post("/", (req, res) => {
             : chat.user_a;
 
     const serializedEnvelope = JSON.stringify(envelope);
+    const envelopeHash = hashEnvelope(serializedEnvelope);
 
-    // Support safe retries without creating duplicate messages.
+    // Detect duplicate submissions, including after deletion.
     const existing = db.prepare(`
-        SELECT id, recipient_id, envelope_json
+        SELECT
+            id,
+            recipient_id,
+            envelope_hash,
+            envelope_json
         FROM secure_messages
-        WHERE sender_id = ? AND client_message_id = ?
+        WHERE sender_id = ?
+          AND client_message_id = ?
     `).get(req.user.id, clientMessageId);
 
     if (existing) {
+        const storedHash = existing.envelope_hash ||
+            (
+                existing.envelope_json
+                    ? hashEnvelope(existing.envelope_json)
+                    : null
+            );
+
         if (
             existing.recipient_id !== recipientId ||
-            existing.envelope_json !== serializedEnvelope
+            storedHash !== envelopeHash
         ) {
             return res.status(409).json({
                 error: "Client message ID already used"
@@ -161,9 +189,14 @@ router.post("/", (req, res) => {
     }
 
     const messageId = randomUUID();
-    const createdAt = new Date().toISOString();
+
+    const createdAtMs = Date.now();
+    const createdAt = new Date(createdAtMs).toISOString();
+
+    const expiresAt = createdAtMs + MESSAGE_RETENTION_MS;
 
     try {
+        // Store ciphertext and retention metadata.
         db.prepare(`
             INSERT INTO secure_messages (
                 id,
@@ -171,29 +204,38 @@ router.post("/", (req, res) => {
                 recipient_id,
                 client_message_id,
                 envelope_json,
-                created_at
+                created_at,
+                expires_at,
+                envelope_hash
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         `).run(
             messageId,
             req.user.id,
             recipientId,
             clientMessageId,
             serializedEnvelope,
-            createdAt
+            createdAt,
+            expiresAt,
+            envelopeHash
         );
 
+        // Notify online recipients without sending plaintext.
         try {
-    notifyMessageAvailable(recipientId, messageId);
-} catch (error) {
-    console.error("WebSocket notification failed:", error.message);
-}
+            notifyMessageAvailable(recipientId, messageId);
+        } catch (error) {
+            console.error(
+                "WebSocket notification failed:",
+                error.message
+            );
+        }
 
         return res.status(201).json({
             message: "Encrypted message stored",
             messageId,
             createdAt
         });
+
     } catch (error) {
         if (error.code?.startsWith("SQLITE_CONSTRAINT")) {
             return res.status(409).json({
@@ -209,7 +251,7 @@ router.post("/", (req, res) => {
     }
 });
 
-// Retrieve only the authenticated recipient's pending messages.
+// Retrieve the authenticated recipient's unexpired messages.
 router.get("/inbox", (req, res) => {
     const limit = req.query.limit === undefined
         ? 50
@@ -238,17 +280,27 @@ router.get("/inbox", (req, res) => {
             FROM secure_messages m
             JOIN direct_chats c
               ON (
-                (c.user_a = m.sender_id
-                 AND c.user_b = m.recipient_id)
+                (
+                    c.user_a = m.sender_id
+                    AND c.user_b = m.recipient_id
+                )
                 OR
-                (c.user_b = m.sender_id
-                 AND c.user_a = m.recipient_id)
+                (
+                    c.user_b = m.sender_id
+                    AND c.user_a = m.recipient_id
+                )
               )
             WHERE m.recipient_id = ?
               AND m.acknowledged_at IS NULL
+              AND m.envelope_json <> ''
+              AND m.expires_at > ?
             ORDER BY m.created_at ASC, m.id ASC
             LIMIT ?
-        `).all(req.user.id, limit);
+        `).all(
+            req.user.id,
+            Date.now(),
+            limit
+        );
 
         const messages = rows.map(row => ({
             id: row.id,
@@ -261,6 +313,7 @@ router.get("/inbox", (req, res) => {
         }));
 
         return res.json({ messages });
+
     } catch (error) {
         console.error("Secure inbox retrieval failed");
 
@@ -270,7 +323,7 @@ router.get("/inbox", (req, res) => {
     }
 });
 
-// Acknowledge receipt of an encrypted message.
+// Acknowledge receipt and clear ciphertext from the active row.
 router.post("/:id/ack", (req, res) => {
     const messageId = req.params.id;
 
@@ -280,10 +333,16 @@ router.post("/:id/ack", (req, res) => {
         });
     }
 
+    // Only the intended recipient can acknowledge.
     const message = db.prepare(`
-        SELECT id, acknowledged_at
+        SELECT
+            id,
+            acknowledged_at,
+            expires_at,
+            envelope_json
         FROM secure_messages
-        WHERE id = ? AND recipient_id = ?
+        WHERE id = ?
+          AND recipient_id = ?
     `).get(messageId, req.user.id);
 
     if (!message) {
@@ -292,6 +351,7 @@ router.post("/:id/ack", (req, res) => {
         });
     }
 
+    // Repeated ACK requests are safe.
     if (message.acknowledged_at) {
         return res.json({
             message: "Already acknowledged",
@@ -299,23 +359,49 @@ router.post("/:id/ack", (req, res) => {
         });
     }
 
+    const nowMs = Date.now();
+
+    // Expired or already-purged messages cannot be acknowledged.
+    if (
+        !Number.isSafeInteger(message.expires_at) ||
+        message.expires_at <= nowMs ||
+        !message.envelope_json
+    ) {
+        return res.status(410).json({
+            error: "Message no longer available"
+        });
+    }
+
+    // Atomically mark delivery and clear the encrypted payload.
     const result = db.prepare(`
         UPDATE secure_messages
-        SET acknowledged_at = ?
+        SET
+            acknowledged_at = ?,
+            envelope_json = '',
+            purged_at = ?
         WHERE id = ?
           AND recipient_id = ?
           AND acknowledged_at IS NULL
+          AND envelope_json <> ''
+          AND expires_at > ?
     `).run(
-        new Date().toISOString(),
+        new Date(nowMs).toISOString(),
+        nowMs,
         messageId,
-        req.user.id
+        req.user.id,
+        nowMs
     );
 
+    if (result.changes !== 1) {
+        return res.status(409).json({
+            error: "Message state changed"
+        });
+    }
+
     return res.json({
-        message: result.changes === 1
-            ? "Message acknowledged"
-            : "Already acknowledged",
-        messageId
+        message: "Message acknowledged",
+        messageId,
+        ciphertextDeleted: true
     });
 });
 

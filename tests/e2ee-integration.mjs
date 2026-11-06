@@ -43,14 +43,12 @@ async function createTestUser(label, suffix) {
     const username = `e2ee_${label}_${suffix}`;
     const email = `${username}@example.test`;
 
-    // Generate keys locally using the real crypto library.
     const { account } = await Account.create();
 
     const bundle = await account.createPreKeyUpload({
         oneTimePreKeyCount: 4
     });
 
-    // Register the account.
     await api("POST", "/api/auth/register", {
         username,
         email,
@@ -58,7 +56,6 @@ async function createTestUser(label, suffix) {
         publicKey: bundle.identityKey
     });
 
-    // Log in and get the session cookie.
     const login = await api("POST", "/api/auth/login", {
         email,
         password: PASSWORD
@@ -69,7 +66,6 @@ async function createTestUser(label, suffix) {
 
     assert.ok(cookie, "Missing authentication cookie");
 
-    // Obtain and sign a server challenge.
     const ticket = await api(
         "POST",
         "/api/keys/challenge",
@@ -81,7 +77,6 @@ async function createTestUser(label, suffix) {
         ticket.data.challenge
     );
 
-    // Register public keys, never private keys.
     await api("POST", "/api/keys/upload", {
         bundle,
         contactCode: account.contactCode,
@@ -185,7 +180,6 @@ async function main() {
         envelope
     };
 
-    // Sanity check: no plaintext in the transmitted JSON.
     assert.equal(
         JSON.stringify(messageBody).includes(originalMessage),
         false
@@ -243,8 +237,15 @@ async function main() {
     const aliceRestored = await Account.importState(aliceState);
     const bobRestored = await Account.importState(bobState);
 
-    assert.equal(aliceRestored.contactCode, alice.account.contactCode);
-    assert.equal(bobRestored.contactCode, bob.account.contactCode);
+    assert.equal(
+        aliceRestored.contactCode,
+        alice.account.contactCode
+    );
+
+    assert.equal(
+        bobRestored.contactCode,
+        bob.account.contactCode
+    );
 
     console.log("13. Bob encrypts a reply...");
 
@@ -271,7 +272,10 @@ async function main() {
         bob.cookie
     );
 
-    assert.equal(reply.data.message, "Encrypted message stored");
+    assert.equal(
+        reply.data.message,
+        "Encrypted message stored"
+    );
 
     console.log("15. Alice retrieves Bob's reply...");
 
@@ -286,7 +290,11 @@ async function main() {
         m => m.id === reply.data.messageId
     );
 
-    assert.ok(receivedReply, "Alice did not receive Bob's reply");
+    assert.ok(
+        receivedReply,
+        "Alice did not receive Bob's reply"
+    );
+
     assert.equal(receivedReply.senderId, bob.userId);
 
     console.log("16. Alice decrypts Bob's reply...");
@@ -297,6 +305,238 @@ async function main() {
     );
 
     assert.equal(decryptedReply, replyText);
+
+    // =====================================================
+    // TEST 16A - ENCRYPTED MESSAGE DELETION
+    // =====================================================
+
+    console.log("16A. Testing encrypted-message deletion...");
+
+    const retentionInbox = await api(
+        "GET",
+        "/api/secure-messages/inbox",
+        undefined,
+        bob.cookie
+    );
+
+    const retentionMessage = retentionInbox.data.messages.find(
+        message => message.senderId === alice.userId
+    );
+
+    assert.ok(
+        retentionMessage,
+        "Expected Alice's pending encrypted message"
+    );
+
+    const retentionAck = await api(
+        "POST",
+        `/api/secure-messages/${retentionMessage.id}/ack`,
+        {},
+        bob.cookie
+    );
+
+    assert.equal(
+        retentionAck.data.ciphertextDeleted,
+        true
+    );
+
+    console.log("Message acknowledgement: PASSED");
+
+    const retentionDb = requireFromServer("./src/database");
+
+    const storedMessage = retentionDb.prepare(`
+        SELECT
+            envelope_json,
+            envelope_hash,
+            acknowledged_at,
+            purged_at
+        FROM secure_messages
+        WHERE id = ?
+    `).get(retentionMessage.id);
+
+    assert.ok(storedMessage);
+    assert.equal(storedMessage.envelope_json, "");
+    assert.ok(storedMessage.envelope_hash);
+    assert.ok(storedMessage.acknowledged_at);
+    assert.ok(storedMessage.purged_at);
+
+    console.log(
+        "Ciphertext cleared from active database row: PASSED"
+    );
+
+    const inboxAfterAck = await api(
+        "GET",
+        "/api/secure-messages/inbox",
+        undefined,
+        bob.cookie
+    );
+
+    assert.equal(
+        inboxAfterAck.data.messages.some(
+            message => message.id === retentionMessage.id
+        ),
+        false
+    );
+
+    console.log(
+        "Acknowledged message removed from inbox: PASSED"
+    );
+
+    const secondAck = await api(
+        "POST",
+        `/api/secure-messages/${retentionMessage.id}/ack`,
+        {},
+        bob.cookie
+    );
+
+    assert.equal(
+        secondAck.data.message,
+        "Already acknowledged"
+    );
+
+    console.log("Repeated acknowledgement: PASSED");
+
+    const duplicateAfterAck = await api(
+        "POST",
+        "/api/secure-messages",
+        {
+            chatId: retentionMessage.chatId,
+            clientMessageId: retentionMessage.clientMessageId,
+            envelope: retentionMessage.envelope
+        },
+        alice.cookie
+    );
+
+    assert.equal(duplicateAfterAck.data.duplicate, true);
+
+    assert.equal(
+        duplicateAfterAck.data.messageId,
+        retentionMessage.id
+    );
+
+    console.log("Duplicate retry after deletion: PASSED");
+    console.log("MESSAGE DELETION TESTS PASSED!");
+
+    // =====================================================
+    // TEST 16B - UNAUTHORIZED ACKNOWLEDGEMENT
+    // =====================================================
+
+    console.log(
+        "16B. Testing unauthorized message acknowledgement..."
+    );
+
+    await assert.rejects(
+        () => api(
+            "POST",
+            `/api/secure-messages/${receivedReply.id}/ack`,
+            {},
+            bob.cookie
+        ),
+        /HTTP 404/
+    );
+
+    console.log("Unauthorized acknowledgement: BLOCKED");
+
+    const protectedMessage = retentionDb.prepare(`
+        SELECT envelope_json, acknowledged_at
+        FROM secure_messages
+        WHERE id = ?
+    `).get(receivedReply.id);
+
+    assert.ok(protectedMessage);
+    assert.ok(protectedMessage.envelope_json.length > 0);
+    assert.equal(protectedMessage.acknowledged_at, null);
+
+    console.log("Ciphertext remained intact: PASSED");
+    console.log("UNAUTHORIZED ACK SECURITY TEST PASSED!");
+
+    // =====================================================
+    // TEST 16C - MESSAGE EXPIRATION
+    // =====================================================
+
+    console.log("16C. Testing message expiration...");
+
+    const expiredMessageId = receivedReply.id;
+    const expiredAt = Date.now() - 1000;
+
+    const expirationUpdate = retentionDb.prepare(`
+        UPDATE secure_messages
+        SET expires_at = ?
+        WHERE id = ?
+          AND recipient_id = ?
+          AND acknowledged_at IS NULL
+    `).run(
+        expiredAt,
+        expiredMessageId,
+        alice.userId
+    );
+
+    assert.equal(expirationUpdate.changes, 1);
+
+    console.log("Message expiration simulated: PASSED");
+
+    const expiredInbox = await api(
+        "GET",
+        "/api/secure-messages/inbox",
+        undefined,
+        alice.cookie
+    );
+
+    assert.equal(
+        expiredInbox.data.messages.some(
+            message => message.id === expiredMessageId
+        ),
+        false
+    );
+
+    console.log("Expired message hidden from inbox: PASSED");
+
+    await assert.rejects(
+        () => api(
+            "POST",
+            `/api/secure-messages/${expiredMessageId}/ack`,
+            {},
+            alice.cookie
+        ),
+        /HTTP 410/
+    );
+
+    console.log("Expired message acknowledgement: BLOCKED");
+
+    // The scheduler may already have removed the ciphertext.
+    const expiredRecord = retentionDb.prepare(`
+        SELECT
+            envelope_json,
+            expires_at,
+            acknowledged_at,
+            purged_at
+        FROM secure_messages
+        WHERE id = ?
+    `).get(expiredMessageId);
+
+    assert.ok(expiredRecord);
+    assert.ok(expiredRecord.expires_at <= Date.now());
+    assert.equal(expiredRecord.acknowledged_at, null);
+
+    if (expiredRecord.envelope_json === "") {
+        assert.ok(expiredRecord.purged_at);
+
+        console.log(
+            "Expired ciphertext cleared by cleanup: PASSED"
+        );
+    } else {
+        assert.equal(expiredRecord.purged_at, null);
+
+        console.log(
+            "Expired ciphertext awaiting cleanup: CONFIRMED"
+        );
+    }
+
+    console.log("MESSAGE EXPIRATION TESTS PASSED!");
+
+    // =====================================================
+    // TEST 17 - REPLAY ATTACK
+    // =====================================================
 
     console.log("17. Testing replay attack protection...");
 
@@ -310,6 +550,10 @@ async function main() {
 
     console.log("Replay attack: BLOCKED");
 
+    // =====================================================
+    // TEST 18 - CIPHERTEXT TAMPERING
+    // =====================================================
+
     console.log("18. Testing ciphertext tampering...");
 
     const genuine = await bobRestored.encrypt(
@@ -319,8 +563,13 @@ async function main() {
 
     const tampered = structuredClone(genuine);
 
-    const bytes = Buffer.from(tampered.ciphertext, "base64");
+    const bytes = Buffer.from(
+        tampered.ciphertext,
+        "base64"
+    );
+
     bytes[bytes.length - 1] ^= 1;
+
     tampered.ciphertext = bytes.toString("base64");
 
     await assert.rejects(
@@ -343,7 +592,13 @@ async function main() {
     console.log("Valid message after tampering: DECRYPTED");
     console.log("REPLAY AND TAMPERING TESTS PASSED!");
 
-    console.log("19. Testing authenticated cross-origin protection...");
+    // =====================================================
+    // TEST 19 - MALICIOUS ORIGIN
+    // =====================================================
+
+    console.log(
+        "19. Testing authenticated cross-origin protection..."
+    );
 
     const maliciousResponse = await fetch(
         "http://localhost:3000/api/keys/challenge",
@@ -360,9 +615,17 @@ async function main() {
 
     assert.equal(maliciousResponse.status, 403);
 
-    console.log("Authenticated malicious-origin request: BLOCKED");
+    console.log(
+        "Authenticated malicious-origin request: BLOCKED"
+    );
 
-    console.log("20. Testing authenticated trusted-origin request...");
+    // =====================================================
+    // TEST 20 - TRUSTED ORIGIN
+    // =====================================================
+
+    console.log(
+        "20. Testing authenticated trusted-origin request..."
+    );
 
     const trustedResponse = await fetch(
         "http://localhost:3000/api/keys/challenge",
@@ -379,10 +642,19 @@ async function main() {
 
     assert.equal(trustedResponse.status, 200);
 
-    console.log("Authenticated trusted-origin request: ALLOWED");
+    console.log(
+        "Authenticated trusted-origin request: ALLOWED"
+    );
+
     console.log("HTTP ORIGIN SECURITY TESTS PASSED!");
 
-    console.log("23. Opening Alice's WebSocket before logout...");
+    // =====================================================
+    // TEST 23 - OPEN WEBSOCKET BEFORE LOGOUT
+    // =====================================================
+
+    console.log(
+        "23. Opening Alice's WebSocket before logout..."
+    );
 
     const aliceSocket = new WebSocket(
         "ws://127.0.0.1:3000/ws",
@@ -397,7 +669,10 @@ async function main() {
     await new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
             aliceSocket.terminate();
-            reject(new Error("WebSocket connection timed out"));
+
+            reject(new Error(
+                "WebSocket connection timed out"
+            ));
         }, 10000);
 
         aliceSocket.once("open", () => {
@@ -418,6 +693,7 @@ async function main() {
     const socketClosed = new Promise((resolve, reject) => {
         const timeout = setTimeout(() => {
             aliceSocket.terminate();
+
             reject(new Error(
                 "Revoked WebSocket remained open too long"
             ));
@@ -425,7 +701,9 @@ async function main() {
 
         aliceSocket.on("message", data => {
             try {
-                const event = JSON.parse(data.toString());
+                const event = JSON.parse(
+                    data.toString()
+                );
 
                 if (event.type === "message_available") {
                     unexpectedNotification = true;
@@ -446,7 +724,13 @@ async function main() {
         });
     });
 
-    console.log("21. Testing session revocation after logout...");
+    // =====================================================
+    // TEST 21 - SESSION REVOCATION
+    // =====================================================
+
+    console.log(
+        "21. Testing session revocation after logout..."
+    );
 
     const logoutResponse = await fetch(
         "http://localhost:3000/api/auth/logout",
@@ -468,7 +752,6 @@ async function main() {
 
     console.log("Alice logged out successfully.");
 
-    // Deliberately reuse Alice's old session cookie.
     const revokedResponse = await fetch(
         "http://localhost:3000/api/me",
         {
@@ -483,7 +766,13 @@ async function main() {
     console.log("Old session cookie: REJECTED");
     console.log("SESSION REVOCATION TEST PASSED!");
 
-    console.log("22. Testing WebSocket access after logout...");
+    // =====================================================
+    // TEST 22 - REVOKED WEBSOCKET
+    // =====================================================
+
+    console.log(
+        "22. Testing WebSocket access after logout..."
+    );
 
     await new Promise((resolve, reject) => {
         const ws = new WebSocket(
@@ -514,9 +803,18 @@ async function main() {
     });
 
     console.log("Revoked WebSocket session: BLOCKED");
-    console.log("WEBSOCKET SESSION SECURITY TEST PASSED!");
 
-    console.log("24. Bob sends a message after Alice's logout...");
+    console.log(
+        "WEBSOCKET SESSION SECURITY TEST PASSED!"
+    );
+
+    // =====================================================
+    // TEST 24 - WEBSOCKET LOGOUT SECURITY
+    // =====================================================
+
+    console.log(
+        "24. Bob sends a message after Alice's logout..."
+    );
 
     const postLogoutEnvelope = await bobRestored.encrypt(
         aliceRestored.contactCode,
@@ -539,7 +837,9 @@ async function main() {
         "Encrypted message stored"
     );
 
-    console.log("Encrypted message stored for offline delivery.");
+    console.log(
+        "Encrypted message stored for offline delivery."
+    );
 
     const closeCode = await socketClosed;
 
@@ -547,8 +847,18 @@ async function main() {
     assert.equal(unexpectedNotification, false);
 
     console.log("Already-open WebSocket: REVOKED");
-    console.log("Unauthorized notification: NOT DELIVERED");
-    console.log("WEBSOCKET LOGOUT SECURITY TEST PASSED!");
+
+    console.log(
+        "Unauthorized notification: NOT DELIVERED"
+    );
+
+    console.log(
+        "WEBSOCKET LOGOUT SECURITY TEST PASSED!"
+    );
+
+    // =====================================================
+    // FINAL RESULTS
+    // =====================================================
 
     console.log("\n--- ADDITIONAL TEST RESULTS ---");
     console.log("Account state restoration: PASSED");
@@ -564,6 +874,7 @@ async function main() {
     console.log("Server delivery: SUCCESS");
     console.log("Bob decrypted:", decryptedMessage);
     console.log("Plaintext round-trip: PASSED");
+
     console.log("\nALL E2EE INTEGRATION TESTS PASSED!");
 }
 

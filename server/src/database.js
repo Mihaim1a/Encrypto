@@ -1,5 +1,6 @@
 
 const { DatabaseSync } = require("node:sqlite");
+const { createHash } = require("node:crypto");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -177,5 +178,81 @@ db.exec(`
         created_at
     );
 `);
+
+const MESSAGE_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+
+// Add retention fields without deleting existing messages.
+const secureMessageColumns = new Set(
+    db.prepare("PRAGMA table_info(secure_messages)")
+        .all()
+        .map(column => column.name)
+);
+
+if (!secureMessageColumns.has("expires_at")) {
+    db.exec(`
+        ALTER TABLE secure_messages
+        ADD COLUMN expires_at INTEGER
+    `);
+}
+
+if (!secureMessageColumns.has("envelope_hash")) {
+    db.exec(`
+        ALTER TABLE secure_messages
+        ADD COLUMN envelope_hash TEXT
+    `);
+}
+
+if (!secureMessageColumns.has("purged_at")) {
+    db.exec(`
+        ALTER TABLE secure_messages
+        ADD COLUMN purged_at INTEGER
+    `);
+}
+
+db.exec(`
+    CREATE INDEX IF NOT EXISTS idx_secure_messages_expiry
+    ON secure_messages(expires_at)
+`);
+
+// Populate retention metadata for previously stored messages.
+const oldMessages = db.prepare(`
+    SELECT
+        id,
+        envelope_json,
+        created_at,
+        expires_at,
+        envelope_hash
+    FROM secure_messages
+    WHERE expires_at IS NULL
+       OR envelope_hash IS NULL
+`).all();
+
+const updateOldMessage = db.prepare(`
+    UPDATE secure_messages
+    SET
+        expires_at = COALESCE(expires_at, ?),
+        envelope_hash = COALESCE(envelope_hash, ?)
+    WHERE id = ?
+`);
+
+for (const message of oldMessages) {
+    const created = Date.parse(message.created_at);
+
+    const expiresAt = (
+        Number.isFinite(created) ? created : Date.now()
+    ) + MESSAGE_RETENTION_MS;
+
+    const envelopeHash = createHash("sha256")
+        .update(message.envelope_json, "utf8")
+        .digest("hex");
+
+    updateOldMessage.run(
+        expiresAt,
+        envelopeHash,
+        message.id
+    );
+}
+
+console.log("Encrypto message retention schema ready!");
 
 module.exports = db;
