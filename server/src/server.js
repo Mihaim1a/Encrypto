@@ -51,6 +51,25 @@ app.use(cookieParser());
 // Protect against untrusted request origins.
 app.use(enforceOrigin);
 
+// Expose only the client-side cryptography modules.
+// Do not expose the server directory or database.
+const clientCryptoDirectory = path.resolve(
+    __dirname,
+    "../../crypto/src"
+);
+
+app.use(
+    "/client-crypto",
+    express.static(clientCryptoDirectory, {
+        dotfiles: "deny",
+        index: false,
+        fallthrough: false,
+        setHeaders(res) {
+            res.setHeader("Cache-Control", "no-store");
+        }
+    })
+);
+
 // Prevent caching API responses.
 app.use("/api", (req, res, next) => {
     res.set("Cache-Control", "no-store");
