@@ -89,4 +89,20 @@ db.prepare(
     "DELETE FROM sessions WHERE expires_at <= ?"
 ).run(Date.now());
 
+db.exec(`
+    CREATE TABLE IF NOT EXISTS direct_messages (
+        id TEXT PRIMARY KEY,
+        sender_id TEXT NOT NULL,
+        recipient_id TEXT NOT NULL,
+        encrypted_envelope TEXT NOT NULL,
+        envelope_version INTEGER NOT NULL,
+        created_at TEXT NOT NULL,
+        FOREIGN KEY (sender_id) REFERENCES users(id),
+        FOREIGN KEY (recipient_id) REFERENCES users(id)
+    );
+
+    CREATE INDEX IF NOT EXISTS idx_direct_messages_users
+    ON direct_messages(sender_id, recipient_id, created_at);
+`);
+
 module.exports = db;

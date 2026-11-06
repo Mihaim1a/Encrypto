@@ -3,7 +3,9 @@ const express = require("express");
 const cookieParser = require("cookie-parser");
 
 const db = require("./database");
+const usersRoutes = require("./routes/users");
 const authRoutes = require("./routes/auth");
+const messagesRoutes = require("./routes/messages");
 const { requireAuth } = require("./session");
 
 const app = express();
@@ -15,6 +17,8 @@ app.use(cookieParser());
 
 // Rutele de autentificare
 app.use("/api/auth", authRoutes);
+app.use("/api/users", usersRoutes);
+app.use("/api/messages", messagesRoutes);
 
 // Returnam utilizatorul autentificat
 app.get("/api/me", requireAuth, (req, res) => {
