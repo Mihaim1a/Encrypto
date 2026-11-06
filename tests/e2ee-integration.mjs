@@ -648,6 +648,114 @@ async function main() {
 
     console.log("HTTP ORIGIN SECURITY TESTS PASSED!");
 
+    
+    // =====================================================
+    // TEST 25 - UNAUTHORIZED CHAT ACCESS / IDOR
+    // =====================================================
+
+    console.log("25. Testing unauthorized chat access...");
+
+    // Create Charlie: an authenticated third-party user.
+    const charlie = await createTestUser("c", suffix);
+
+    console.log("Charlie account created: PASSED");
+
+    // Charlie must not see Alice and Bob's private chat.
+    const charlieChats = await api(
+        "GET",
+        "/api/chats",
+        undefined,
+        charlie.cookie
+    );
+
+    assert.equal(
+        charlieChats.data.chats.some(
+            chat => chat.id === chatId
+        ),
+        false
+    );
+
+    console.log("Private chat hidden from Charlie: PASSED");
+
+    // Charlie cannot accept Alice and Bob's chat invitation.
+    await assert.rejects(
+        () => api(
+            "POST",
+            `/api/chats/${chatId}/accept`,
+            {},
+            charlie.cookie
+        ),
+        /HTTP 404/
+    );
+
+    console.log("Unauthorized chat acceptance: BLOCKED");
+
+    // Charlie cannot decline a chat he doesn't belong to.
+    await assert.rejects(
+        () => api(
+            "POST",
+            `/api/chats/${chatId}/decline`,
+            {},
+            charlie.cookie
+        ),
+        /HTTP 404/
+    );
+
+    console.log("Unauthorized chat decline: BLOCKED");
+
+    // Charlie tries to inject ciphertext into Alice and Bob's chat.
+    const unauthorizedMessageId = randomUUID();
+
+    await assert.rejects(
+        () => api(
+            "POST",
+            "/api/secure-messages",
+            {
+                chatId,
+                clientMessageId: unauthorizedMessageId,
+                envelope: messageBody.envelope
+            },
+            charlie.cookie
+        ),
+        /HTTP (403|404)/
+    );
+
+    console.log("Unauthorized message injection: BLOCKED");
+
+    // Check directly that the server stored nothing.
+    const unauthorizedRecord = retentionDb.prepare(`
+        SELECT COUNT(*) AS count
+        FROM secure_messages
+        WHERE sender_id = ?
+          AND client_message_id = ?
+    `).get(
+        charlie.userId,
+        unauthorizedMessageId
+    );
+
+    assert.equal(unauthorizedRecord.count, 0);
+
+    console.log("Unauthorized ciphertext not stored: PASSED");
+
+    // Verify Alice and Bob's chat is still active.
+    const aliceChatsAfterAttack = await api(
+        "GET",
+        "/api/chats",
+        undefined,
+        alice.cookie
+    );
+
+    const protectedChat = aliceChatsAfterAttack.data.chats.find(
+        chat => chat.id === chatId
+    );
+
+    assert.ok(protectedChat);
+    assert.equal(protectedChat.status, "active");
+
+    console.log("Original chat remained active: PASSED");
+
+    console.log("IDOR SECURITY TESTS PASSED!");
+
     // =====================================================
     // TEST 23 - OPEN WEBSOCKET BEFORE LOGOUT
     // =====================================================
