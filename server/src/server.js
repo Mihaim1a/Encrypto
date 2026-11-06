@@ -3,6 +3,7 @@
 
 const express = require("express");
 const cookieParser = require("cookie-parser");
+const helmet = require("helmet");
 const http = require("node:http");
 
 const { setupRealtime } = require("./realtime");
@@ -22,32 +23,54 @@ const { requireAuth } = require("./session");
 const app = express();
 const PORT = 3000;
 
+const isProduction = process.env.NODE_ENV === "production";
 const CLEANUP_INTERVAL_MS = 60 * 1000;
 
 let cleanupTimer = null;
 
-// Middleware.
+// Reduce unnecessary framework information.
+app.disable("x-powered-by");
+
+// Apply browser security headers.
+app.use(helmet({
+    // Configure CSP after the frontend architecture is finalized.
+    contentSecurityPolicy: false,
+
+    // Avoid blocking resources needed during frontend integration.
+    crossOriginEmbedderPolicy: false,
+
+    // Enable HSTS in production, not for local HTTP development.
+    strictTransportSecurity: isProduction
+}));
+
+// Parse incoming requests.
 app.use(express.json({ limit: "16kb" }));
 app.use(cookieParser());
+
+// Protect against untrusted request origins.
 app.use(enforceOrigin);
 
-// API routes.
+// Prevent caching API responses.
+app.use("/api", (req, res, next) => {
+    res.set("Cache-Control", "no-store");
+    next();
+});
+
+// Authentication and application routes.
 app.use("/api/auth", authRoutes);
 app.use("/api/users", usersRoutes);
 app.use("/api/keys", keysRoutes);
 app.use("/api/chats", chatsRoutes);
 app.use("/api/secure-messages", secureMessagesRoutes);
 
-// Current authenticated user.
+// Return the authenticated user.
 app.get("/api/me", requireAuth, (req, res) => {
-    res.set("Cache-Control", "no-store");
-
     res.json({
         user: req.user
     });
 });
 
-// Health check.
+// Check backend health.
 app.get("/api/health", (req, res) => {
     const result = db.prepare("SELECT 1 AS ok").get();
 
@@ -58,7 +81,7 @@ app.get("/api/health", (req, res) => {
     });
 });
 
-// Remove expired ciphertext and expired sessions.
+// Remove expired ciphertext and sessions.
 function runMaintenance() {
     try {
         const cleared = purgeEligibleMessages();
@@ -94,13 +117,13 @@ function runMaintenance() {
     }
 }
 
-// HTTP server.
+// Create the HTTP server.
 const server = http.createServer(app);
 
-// Authenticated WebSocket notifications.
+// Attach authenticated WebSocket notifications.
 setupRealtime(server);
 
-// Stop maintenance when the server closes.
+// Stop the maintenance timer when the server closes.
 server.on("close", () => {
     if (cleanupTimer !== null) {
         clearInterval(cleanupTimer);
@@ -110,14 +133,12 @@ server.on("close", () => {
     console.log("[Maintenance] Cleanup scheduler stopped");
 });
 
-// Start the backend.
+// Start Encrypto.
 server.listen(PORT, "127.0.0.1", () => {
     console.log(`Server running on http://localhost:${PORT}`);
 
-    // Run immediately on startup.
     runMaintenance();
 
-    // Run again every 60 seconds.
     cleanupTimer = setInterval(
         runMaintenance,
         CLEANUP_INTERVAL_MS
