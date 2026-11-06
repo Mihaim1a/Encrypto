@@ -20,19 +20,15 @@ const secureMessagesRoutes = require("./routes/secure-messages");
 const { requireAuth } = require("./session");
 
 const app = express();
-
 const PORT = 3000;
 
-// Run message cleanup every 60 seconds.
 const CLEANUP_INTERVAL_MS = 60 * 1000;
 
 let cleanupTimer = null;
 
-// Parse JSON and cookies.
+// Middleware.
 app.use(express.json({ limit: "16kb" }));
 app.use(cookieParser());
-
-// Protect requests against untrusted origins.
 app.use(enforceOrigin);
 
 // API routes.
@@ -42,7 +38,7 @@ app.use("/api/keys", keysRoutes);
 app.use("/api/chats", chatsRoutes);
 app.use("/api/secure-messages", secureMessagesRoutes);
 
-// Return the authenticated user.
+// Current authenticated user.
 app.get("/api/me", requireAuth, (req, res) => {
     res.set("Cache-Control", "no-store");
 
@@ -51,7 +47,7 @@ app.get("/api/me", requireAuth, (req, res) => {
     });
 });
 
-// Check server and database status.
+// Health check.
 app.get("/api/health", (req, res) => {
     const result = db.prepare("SELECT 1 AS ok").get();
 
@@ -62,8 +58,8 @@ app.get("/api/health", (req, res) => {
     });
 });
 
-// Safely clear expired and previously acknowledged ciphertext.
-function runMessageCleanup() {
+// Remove expired ciphertext and expired sessions.
+function runMaintenance() {
     try {
         const cleared = purgeEligibleMessages();
 
@@ -72,51 +68,64 @@ function runMessageCleanup() {
                 `[Retention] Cleared ${cleared} encrypted payload(s)`
             );
         }
-
-        return cleared;
     } catch (error) {
         console.error(
             "[Retention] Cleanup failed:",
             error.message
         );
+    }
 
-        return 0;
+    try {
+        const result = db.prepare(`
+            DELETE FROM sessions
+            WHERE expires_at <= ?
+        `).run(Date.now());
+
+        if (result.changes > 0) {
+            console.log(
+                `[Sessions] Removed ${result.changes} expired session(s)`
+            );
+        }
+    } catch (error) {
+        console.error(
+            "[Sessions] Cleanup failed:",
+            error.message
+        );
     }
 }
 
-// Create the HTTP server.
+// HTTP server.
 const server = http.createServer(app);
 
-// Attach authenticated WebSocket support.
+// Authenticated WebSocket notifications.
 setupRealtime(server);
 
-// Stop the cleanup timer when the HTTP server closes.
+// Stop maintenance when the server closes.
 server.on("close", () => {
     if (cleanupTimer !== null) {
         clearInterval(cleanupTimer);
         cleanupTimer = null;
     }
 
-    console.log("[Retention] Cleanup scheduler stopped");
+    console.log("[Maintenance] Cleanup scheduler stopped");
 });
 
 // Start the backend.
 server.listen(PORT, "127.0.0.1", () => {
     console.log(`Server running on http://localhost:${PORT}`);
 
-    // Initial cleanup on startup.
-    runMessageCleanup();
+    // Run immediately on startup.
+    runMaintenance();
 
-    // Repeat cleanup automatically.
+    // Run again every 60 seconds.
     cleanupTimer = setInterval(
-        runMessageCleanup,
+        runMaintenance,
         CLEANUP_INTERVAL_MS
     );
 
-    // Do not keep Node.js alive solely for this timer.
     cleanupTimer.unref();
 
     console.log(
-        "[Retention] Automatic cleanup enabled (every 60 seconds)"
+        "[Maintenance] Automatic cleanup enabled (every 60 seconds)"
     );
 });
