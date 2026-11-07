@@ -13,7 +13,16 @@
  *
  * This class is not safe for concurrent use. Account serializes all access to it.
  */
-import { bytesEqual, concatBytes, fromBase64, readU32, toBase64, u32ToBytes } from './encoding.js';
+import { bytesEqual, concatBytes, readU32, toBase64, u32ToBytes } from './encoding.js';
+import {
+  expectArray,
+  expectBytes,
+  expectInt,
+  expectKeyPair,
+  expectNullableBytes,
+  expectObject,
+  invalidState,
+} from './state.js';
 import {
   DecryptionError,
   ZERO_SALT,
@@ -126,8 +135,16 @@ async function decryptWithState(s, header, headerBytes, ciphertext) {
     return decryptWithMessageKey(skippedKey, ciphertext, associatedData);
   }
 
+  // Work limit, checked before any key derivation: an unauthenticated header can never make
+  // us derive more than MAX_SKIP keys in total (old chain + new chain together).
+  const newChain = s.dhRemote === null || !bytesEqual(header.dh, s.dhRemote);
+  const keysToSkip = newChain
+    ? (s.receivingChainKey === null ? 0 : Math.max(0, header.pn - s.nr)) + header.n
+    : header.n - s.nr;
+  if (keysToSkip > MAX_SKIP) throw new DecryptionError('Too many skipped messages');
+
   // 2. The other side has a new ratchet key: finish the current chain, then step the DH ratchet.
-  if (s.dhRemote === null || !bytesEqual(header.dh, s.dhRemote)) {
+  if (newChain) {
     await skipMessageKeys(s, header.pn);
     await dhRatchetStep(s, header.dh);
   } else if (header.n < s.nr) {
@@ -213,16 +230,40 @@ export class RatchetSession {
   }
 
   /**
-   * Decrypts a message. The state is only updated if the message authenticates, so forged,
-   * corrupted or replayed messages can never damage the session.
+   * True if the header continues a chain this session already knows (current receiving chain,
+   * or a saved skipped key). Such messages need no DH ratchet step, so they are cheap to try.
    */
-  async decrypt(headerBytes, ciphertext) {
+  knowsChainOf(headerBytes) {
+    const s = this.#state;
+    let header;
+    try {
+      header = decodeHeader(headerBytes);
+    } catch {
+      return false;
+    }
+    if (s.dhRemote !== null && bytesEqual(header.dh, s.dhRemote)) return true;
+    return s.skipped.has(skippedKeyId(header.dh, header.n));
+  }
+
+  /**
+   * Decrypts a message. `decode` turns the plaintext into the result (e.g. remove padding and
+   * decode UTF-8); if it throws, the message counts as invalid. The state is only updated if
+   * the message authenticates AND decodes, so forged, corrupted, malformed or replayed messages
+   * can never damage the session or use up a message key.
+   */
+  async decrypt(headerBytes, ciphertext, decode = (plaintext) => plaintext) {
     const header = decodeHeader(headerBytes);
     const draft = structuredClone(this.#state);
     const plaintext = await decryptWithState(draft, header, headerBytes, ciphertext);
+    let result;
+    try {
+      result = decode(plaintext);
+    } catch (error) {
+      throw error instanceof DecryptionError ? error : new DecryptionError(`Invalid message content: ${error.message}`);
+    }
     draft.pendingPreKey = null; // The other side clearly has this session now.
     this.#state = draft;
-    return plaintext;
+    return result;
   }
 
   toJSON() {
@@ -244,21 +285,51 @@ export class RatchetSession {
     };
   }
 
-  static fromJSON(json) {
-    const bytes = (value, length) => (value === null ? null : fromBase64(value, length));
+  /** Rebuilds a session from toJSON(), validating every field (throws InvalidStateError). */
+  static fromJSON(json, path = 'session') {
+    expectObject(json, path);
+    const skipped = expectArray(json.skipped, `${path}.skipped`, MAX_STORED_SKIPPED_KEYS);
     return new RatchetSession({
-      rootKey: bytes(json.rootKey, 32),
-      sendingChainKey: bytes(json.sendingChainKey, 32),
-      receivingChainKey: bytes(json.receivingChainKey, 32),
-      dhSelf: { publicKey: bytes(json.dhSelf.publicKey, 32), privateKey: bytes(json.dhSelf.privateKey, 32) },
-      dhRemote: bytes(json.dhRemote, 32),
-      ns: json.ns,
-      nr: json.nr,
-      pn: json.pn,
-      skipped: new Map(json.skipped.map(([id, key]) => [id, bytes(key, 32)])),
-      associatedData: bytes(json.associatedData),
-      baseKey: bytes(json.baseKey, 32),
-      pendingPreKey: json.pendingPreKey,
+      rootKey: expectBytes(json.rootKey, `${path}.rootKey`, 32),
+      sendingChainKey: expectNullableBytes(json.sendingChainKey, `${path}.sendingChainKey`, 32),
+      receivingChainKey: expectNullableBytes(json.receivingChainKey, `${path}.receivingChainKey`, 32),
+      dhSelf: expectKeyPair(json.dhSelf, `${path}.dhSelf`),
+      dhRemote: expectNullableBytes(json.dhRemote, `${path}.dhRemote`, 32),
+      ns: expectInt(json.ns, `${path}.ns`),
+      nr: expectInt(json.nr, `${path}.nr`),
+      pn: expectInt(json.pn, `${path}.pn`),
+      skipped: new Map(
+        skipped.map((entry, i) => {
+          const entryPath = `${path}.skipped[${i}]`;
+          expectArray(entry, entryPath, 2);
+          if (typeof entry[0] !== 'string' || !SKIPPED_ID_PATTERN.test(entry[0])) invalidState(entryPath, 'bad key id');
+          return [entry[0], expectBytes(entry[1], entryPath, 32)];
+        }),
+      ),
+      associatedData: expectBytes(json.associatedData, `${path}.associatedData`, ASSOCIATED_DATA_LENGTH),
+      baseKey: expectBytes(json.baseKey, `${path}.baseKey`, 32),
+      pendingPreKey: json.pendingPreKey === null ? null : validatePendingPreKey(json.pendingPreKey, `${path}.pendingPreKey`),
     });
   }
+}
+
+const SKIPPED_ID_PATTERN = /^[A-Za-z0-9+/]{43}=:\d{1,10}$/;
+const ASSOCIATED_DATA_LENGTH = 128; // two identities, each signing key + DH key
+
+function validatePendingPreKey(value, path) {
+  expectObject(value, path);
+  expectBytes(value.identityKey, `${path}.identityKey`, 32);
+  expectBytes(value.identityDHKey, `${path}.identityDHKey`, 32);
+  expectBytes(value.identityBinding, `${path}.identityBinding`, 64);
+  expectBytes(value.ephemeralKey, `${path}.ephemeralKey`, 32);
+  expectInt(value.signedPreKeyId, `${path}.signedPreKeyId`, 1);
+  if (value.oneTimePreKeyId !== null) expectInt(value.oneTimePreKeyId, `${path}.oneTimePreKeyId`, 1);
+  return {
+    identityKey: value.identityKey,
+    identityDHKey: value.identityDHKey,
+    identityBinding: value.identityBinding,
+    ephemeralKey: value.ephemeralKey,
+    signedPreKeyId: value.signedPreKeyId,
+    oneTimePreKeyId: value.oneTimePreKeyId,
+  };
 }

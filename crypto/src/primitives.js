@@ -66,6 +66,13 @@ export async function hkdf(inputKeyMaterial, salt, info, length) {
   return new Uint8Array(bits);
 }
 
+/** Slow, salted password hashing, so stolen data cannot be brute-forced quickly. */
+export async function pbkdf2Sha256(passwordBytes, salt, iterations, length) {
+  const cryptoKey = await subtle.importKey('raw', passwordBytes, 'PBKDF2', false, ['deriveBits']);
+  const bits = await subtle.deriveBits({ name: 'PBKDF2', hash: 'SHA-256', salt, iterations }, cryptoKey, length * 8);
+  return new Uint8Array(bits);
+}
+
 // ---------------------------------------------------------------------------
 // Curve25519 (X25519 key agreement, Ed25519 signatures)
 // ---------------------------------------------------------------------------

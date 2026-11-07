@@ -26,6 +26,10 @@ function signedPreKeyMessage(id, publicKey) {
   return concatBytes(label('signed-prekey'), u32ToBytes(id), publicKey);
 }
 
+export function verifySignedPreKey(identityKey, id, publicKey, signature) {
+  return ed25519Verify(identityKey, signedPreKeyMessage(id, publicKey), signature);
+}
+
 export async function createSignedPreKey(identity, id) {
   const keyPair = await generateX25519KeyPair();
   const signature = await ed25519Sign(identity.signing.privateKey, signedPreKeyMessage(id, keyPair.publicKey));

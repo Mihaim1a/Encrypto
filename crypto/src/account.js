@@ -4,8 +4,24 @@
  * Everything that crosses the network (prekey uploads, bundles, message envelopes, challenge
  * signatures) is a plain JSON-safe object of base64 strings and numbers. The server can store
  * and relay them, but cannot read or forge messages.
+ *
+ * Chats can additionally be protected with a chat password (see chat-lock.js). That is purely
+ * local: the server never sees chat passwords and cannot tell whether a chat has one.
+ *
+ * Persistence: the private state only ever leaves this class encrypted with a storage key (see
+ * state.js). With enableAutoSave(), every state change is saved before the call returns, and
+ * undone if saving fails.
  */
 import { bytesEqual, bytesToUtf8, fromBase64, readU32, toBase64, utf8ToBytes } from './encoding.js';
+import {
+  ChatLockedError,
+  createPasswordLock,
+  generateChatKey,
+  openForChat,
+  openPasswordLock,
+  sealForChat,
+  validateChatPassword,
+} from './chat-lock.js';
 import {
   decodeContactCode,
   decodeRecoveryKey,
@@ -16,9 +32,36 @@ import {
   signChallenge,
   verifyIdentityBinding,
 } from './keys.js';
-import { DecryptionError, generateX25519KeyPair, randomBytes } from './primitives.js';
+import {
+  DecryptionError,
+  ed25519KeyPairFromSeed,
+  generateX25519KeyPair,
+  randomBytes,
+  x25519KeyPairFromSeed,
+} from './primitives.js';
 import { RatchetSession } from './ratchet.js';
-import { UntrustedIdentityError, createSignedPreKey, verifyPreKeyBundle, x3dhInitiate, x3dhRespond } from './x3dh.js';
+import {
+  PersistenceError,
+  expectArray,
+  expectBytes,
+  expectInt,
+  expectKeyPair,
+  expectNullableBytes,
+  expectObject,
+  generateStorageKey,
+  invalidState,
+  openState,
+  parseStorageKey,
+  sealState,
+} from './state.js';
+import {
+  UntrustedIdentityError,
+  createSignedPreKey,
+  verifyPreKeyBundle,
+  verifySignedPreKey,
+  x3dhInitiate,
+  x3dhRespond,
+} from './x3dh.js';
 
 const STATE_VERSION = 1;
 const ENVELOPE_VERSION = 1;
@@ -26,9 +69,20 @@ const ENVELOPE_VERSION = 1;
 const MAX_SESSIONS_PER_CONTACT = 5;
 /** Old signed prekeys kept after rotation, for first messages sent with an older bundle. */
 const MAX_SIGNED_PREKEYS_KEPT = 4;
+/** A signed prekey is due for rotation after this long... */
+const SIGNED_PREKEY_ROTATION_INTERVAL_MS = 7 * 24 * 60 * 60 * 1000;
+/** ...or after this many new conversations were started with it. */
+const SIGNED_PREKEY_ROTATION_AFTER_SESSIONS = 5_000;
+/** Hard limit of remembered first messages per signed prekey (replay protection). */
+const MAX_BASE_KEYS_PER_SIGNED_PREKEY = 10_000;
 const MAX_ONE_TIME_PREKEYS_PER_UPLOAD = 1000;
+/** One-time prekey private keys kept on the device. The oldest are dropped beyond this. */
+const MAX_ONE_TIME_PREKEYS_HELD = 2000;
+const MAX_PREKEY_ID = 0xffffff;
 /** Plaintexts are padded to a multiple of this many bytes to hide their exact length. */
 const PADDING_BLOCK = 160;
+const MIN_PBKDF2_ITERATIONS = 100_000;
+const MAX_PBKDF2_ITERATIONS = 10_000_000;
 
 /** Thrown when there is no session with a contact (call startSession first). */
 export class NoSessionError extends Error {
@@ -56,12 +110,21 @@ function unpad(bytes) {
   return bytes.subarray(0, end);
 }
 
+/** Turns a decrypted message into text. Runs before the session state is committed. */
+function decodeMessage(padded) {
+  try {
+    return bytesToUtf8(unpad(padded));
+  } catch (error) {
+    throw error instanceof DecryptionError ? error : new DecryptionError('Message is not valid UTF-8 text');
+  }
+}
+
 function randomId() {
-  return (readU32(randomBytes(4), 0) % 0xffffff) + 1;
+  return (readU32(randomBytes(4), 0) % MAX_PREKEY_ID) + 1;
 }
 
 function nextId(id) {
-  return (id % 0xffffff) + 1;
+  return (id % MAX_PREKEY_ID) + 1;
 }
 
 function parseId(value, what) {
@@ -71,10 +134,6 @@ function parseId(value, what) {
 
 function keyPairToJSON({ publicKey, privateKey }) {
   return { publicKey: toBase64(publicKey), privateKey: toBase64(privateKey) };
-}
-
-function keyPairFromJSON({ publicKey, privateKey }) {
-  return { publicKey: fromBase64(publicKey, 32), privateKey: fromBase64(privateKey, 32) };
 }
 
 /** Converts a prekey bundle from the server into bytes, validating every field. */
@@ -135,12 +194,27 @@ function parseEnvelope(envelope) {
 export class Account {
   #identity;
   #contactCode;
-  #signedPreKeys; // Map<id, { id, keyPair, signature, createdAt }>, oldest first
+  /**
+   * Map<id, { id, keyPair, signature, createdAt, usedBaseKeys }>, oldest first.
+   * usedBaseKeys: Set of the X3DH ephemeral keys (base64) of every conversation started with
+   * this signed prekey. A first message is only ever accepted once, even if its session was
+   * later deleted and no one-time prekey was involved.
+   */
+  #signedPreKeys;
   #currentSignedPreKeyId;
-  #oneTimePreKeys; // Map<id, keyPair>
+  #oneTimePreKeys; // Map<id, keyPair>, oldest first
   #nextPreKeyId;
   #nextSignedPreKeyId;
   #sessions; // Map<peer identity key (base64), RatchetSession[]>, current session first
+  /**
+   * Map<peer identity key (base64), ChatRecord> for chats that have (or had) a chat password:
+   *   passwordLock:   { salt, iterations, wrappedKey } | null (null once the password is removed)
+   *   chatKey:        Uint8Array while unlocked; null while locked
+   *   sealedSessions: the chat's sessions, encrypted with the chat key, while locked
+   * While a chat is locked, its sessions are NOT in #sessions; they only exist in sealedSessions.
+   */
+  #chats;
+  #autoSave = null; // { storageKey, save }
   #queue = Promise.resolve();
 
   /** @private Use Account.create(), Account.restore() or Account.importState(). */
@@ -153,6 +227,7 @@ export class Account {
     this.#nextPreKeyId = fields.nextPreKeyId;
     this.#nextSignedPreKeyId = fields.nextSignedPreKeyId;
     this.#sessions = fields.sessions;
+    this.#chats = fields.chats;
   }
 
   // --- Creating and recovering accounts -------------------------------------
@@ -196,6 +271,7 @@ export class Account {
       nextPreKeyId: randomId(),
       nextSignedPreKeyId: randomId(),
       sessions: new Map(),
+      chats: new Map(),
     });
   }
 
@@ -207,20 +283,29 @@ export class Account {
   // --- Prekeys (uploaded to the server) ---------------------------------------
 
   /**
-   * Generates prekeys and returns the public data to upload to the server.
-   * - At sign-up / after restore: call once; the server replaces everything it had.
-   * - When the server reports few one-time prekeys left: call again and append them.
-   * - About once a week: call with { rotateSignedPreKey: true }.
+   * Generates prekeys and returns the public data to upload to the server. The server always
+   * takes the signed prekey in the upload as the current one.
+   * - At sign-up / after restore: the server replaces everything it had.
+   * - When the server reports few one-time prekeys left: upload more (the server appends them).
+   * - rotateSignedPreKey: 'auto' (default) rotates when getPreKeyStatus() says it is due,
+   *   true always rotates, false never does.
+   * With auto-save on, the new private keys are saved before this returns, so never upload
+   * public keys whose private halves could still be lost.
    */
-  async createPreKeyUpload({ oneTimePreKeyCount = 100, rotateSignedPreKey = false } = {}) {
+  async createPreKeyUpload({ oneTimePreKeyCount = 100, rotateSignedPreKey = 'auto' } = {}) {
     if (!Number.isInteger(oneTimePreKeyCount) || oneTimePreKeyCount < 0 || oneTimePreKeyCount > MAX_ONE_TIME_PREKEYS_PER_UPLOAD) {
       throw new RangeError(`oneTimePreKeyCount must be an integer from 0 to ${MAX_ONE_TIME_PREKEYS_PER_UPLOAD}`);
     }
-    return this.#withLock(async () => {
-      if (rotateSignedPreKey || this.#currentSignedPreKeyId === null) {
+    if (rotateSignedPreKey !== 'auto' && typeof rotateSignedPreKey !== 'boolean') {
+      throw new TypeError("rotateSignedPreKey must be true, false or 'auto'");
+    }
+    return this.#mutate(async () => {
+      const due = this.#signedPreKeyRotationDue();
+      if (this.#currentSignedPreKeyId === null || rotateSignedPreKey === true || (rotateSignedPreKey === 'auto' && due)) {
         const id = this.#nextSignedPreKeyId;
         this.#nextSignedPreKeyId = nextId(id);
-        this.#signedPreKeys.set(id, await createSignedPreKey(this.#identity, id));
+        const signedPreKey = await createSignedPreKey(this.#identity, id);
+        this.#signedPreKeys.set(id, { ...signedPreKey, usedBaseKeys: new Set() });
         this.#currentSignedPreKeyId = id;
         while (this.#signedPreKeys.size > MAX_SIGNED_PREKEYS_KEPT) {
           this.#signedPreKeys.delete(this.#signedPreKeys.keys().next().value);
@@ -232,8 +317,12 @@ export class Account {
         const id = this.#nextPreKeyId;
         this.#nextPreKeyId = nextId(id);
         const keyPair = await generateX25519KeyPair();
+        this.#oneTimePreKeys.delete(id); // only possible after 16 million ids; keeps insertion order right
         this.#oneTimePreKeys.set(id, keyPair);
         oneTimePreKeys.push({ id, publicKey: toBase64(keyPair.publicKey) });
+      }
+      while (this.#oneTimePreKeys.size > MAX_ONE_TIME_PREKEYS_HELD) {
+        this.#oneTimePreKeys.delete(this.#oneTimePreKeys.keys().next().value);
       }
 
       const spk = this.#signedPreKeys.get(this.#currentSignedPreKeyId);
@@ -245,6 +334,20 @@ export class Account {
     });
   }
 
+  /**
+   * For a periodic maintenance check (e.g. on every app start): if signedPreKeyRotationDue is
+   * true, call createPreKeyUpload({ oneTimePreKeyCount: 0 }) and upload the result.
+   */
+  getPreKeyStatus() {
+    const spk = this.#signedPreKeys.get(this.#currentSignedPreKeyId);
+    return {
+      signedPreKeyId: spk?.id ?? null,
+      signedPreKeyCreatedAt: spk?.createdAt ?? null,
+      signedPreKeyRotationDue: this.#signedPreKeyRotationDue(),
+      oneTimePreKeysHeld: this.#oneTimePreKeys.size,
+    };
+  }
+
   // --- Conversations ----------------------------------------------------------
 
   /**
@@ -254,14 +357,15 @@ export class Account {
    * Throws UntrustedIdentityError if the server's keys do not match the contact code.
    */
   async startSession(contactCode, bundle) {
-    const theirIdentityKey = await decodeContactCode(contactCode);
-    if (bytesEqual(theirIdentityKey, this.#identity.signing.publicKey)) {
+    const { peerId, peerKey } = await this.#peer(contactCode);
+    if (bytesEqual(peerKey, this.#identity.signing.publicKey)) {
       throw new Error('You cannot start a conversation with your own contact code');
     }
     const parsed = parseBundle(bundle);
-    await verifyPreKeyBundle(parsed, theirIdentityKey);
+    await verifyPreKeyBundle(parsed, peerKey);
 
-    return this.#withLock(async () => {
+    return this.#mutate(async () => {
+      this.#assertUnlocked(peerId);
       const { sharedSecret, associatedData, ephemeralPublicKey } = await x3dhInitiate(this.#identity, parsed);
       const session = await RatchetSession.createInitiator({
         sharedSecret,
@@ -275,27 +379,41 @@ export class Account {
           oneTimePreKeyId: parsed.oneTimePreKey ? parsed.oneTimePreKey.id : null,
         },
       });
-      this.#installSession(toBase64(theirIdentityKey), session);
+      this.#installSession(peerId, session);
     });
   }
 
   async hasSession(contactCode) {
-    const peerId = toBase64(await decodeContactCode(contactCode));
+    const { peerId } = await this.#peer(contactCode);
+    const chat = this.#chats.get(peerId);
+    if (chat && chat.chatKey === null) return chat.sealedSessions !== null;
     return (this.#sessions.get(peerId)?.length ?? 0) > 0;
   }
 
-  async deleteSession(contactCode) {
-    const peerId = toBase64(await decodeContactCode(contactCode));
-    return this.#withLock(async () => {
+  /**
+   * Deletes everything about a chat on this device: its sessions, chat password and chat key.
+   * Data sealed with sealChatData for this chat becomes unreadable, so delete it too.
+   * This is also the way out of a forgotten chat password: delete the chat and start a new one.
+   * Old first messages of the deleted chat can still not be replayed.
+   */
+  async deleteChat(contactCode) {
+    const { peerId } = await this.#peer(contactCode);
+    return this.#mutate(async () => {
       this.#sessions.delete(peerId);
+      this.#chats.get(peerId)?.chatKey?.fill(0);
+      this.#chats.delete(peerId);
     });
   }
 
-  /** Encrypts a text message (use JSON for structured content). Returns the envelope to send. */
+  /**
+   * Encrypts a text message (use JSON for structured content). Returns the envelope to send.
+   * Throws ChatLockedError if the chat has a chat password and is locked.
+   */
   async encrypt(contactCode, text) {
-    const peerId = toBase64(await decodeContactCode(contactCode));
+    const { peerId } = await this.#peer(contactCode);
     const plaintext = pad(utf8ToBytes(text));
-    return this.#withLock(async () => {
+    return this.#mutate(async () => {
+      this.#assertUnlocked(peerId);
       const session = this.#sessions.get(peerId)?.[0];
       if (!session) throw new NoSessionError('No conversation with this contact yet. Call startSession() first.');
       const { header, ciphertext } = await session.encrypt(plaintext);
@@ -314,13 +432,16 @@ export class Account {
    * Decrypts an envelope. `senderContactCode` is who the server says sent it; decryption only
    * succeeds if that person really did, so the server cannot fake the sender.
    * Call hasSession(senderContactCode) first if you want to show new conversations as requests.
+   *
+   * Throws ChatLockedError if the chat has a chat password and is locked. Nothing is changed in
+   * that case: keep the envelope (it is still encrypted) and decrypt it after unlockChat().
    */
   async decrypt(senderContactCode, envelope) {
-    const senderKey = await decodeContactCode(senderContactCode);
-    const peerId = toBase64(senderKey);
+    const { peerId, peerKey: senderKey } = await this.#peer(senderContactCode);
     const message = parseEnvelope(envelope);
 
-    return this.#withLock(async () => {
+    return this.#mutate(async () => {
+      this.#assertUnlocked(peerId);
       const sessions = this.#sessions.get(peerId) ?? [];
 
       if (message.type === 'prekey') {
@@ -336,15 +457,131 @@ export class Account {
       if (sessions.length === 0) {
         throw new NoSessionError('No conversation with this contact. Start a new session with them.');
       }
-      for (const session of sessions) {
+      // Sessions that already know this message's chain go first: they need no DH ratchet step,
+      // so the normal case costs one attempt. Each other attempt is capped by MAX_SKIP in the
+      // ratchet, which bounds the work a forged message can cause.
+      const ordered = [
+        ...sessions.filter((s) => s.knowsChainOf(message.header)),
+        ...sessions.filter((s) => !s.knowsChainOf(message.header)),
+      ];
+      let firstError = null; // from the most likely session, so the reason is meaningful
+      for (const session of ordered) {
         try {
           return await this.#decryptWith(peerId, session, message);
         } catch (error) {
           if (!(error instanceof DecryptionError)) throw error;
+          firstError ??= error;
         }
       }
-      throw new DecryptionError('The message could not be decrypted');
+      throw firstError;
     });
+  }
+
+  // --- Chat passwords -----------------------------------------------------------
+
+  /**
+   * Protects one chat with a password the user chooses (at least 6 characters). It is
+   * independent of the login password and of every other chat's password. The chat stays
+   * unlocked until lockChat() / lockAllChats() is called, or the app restarts.
+   * Works before or after the conversation has started.
+   */
+  async setChatPassword(contactCode, password) {
+    validateChatPassword(password);
+    const { peerId, peerKey } = await this.#peer(contactCode);
+    return this.#mutate(async () => {
+      const existing = this.#chats.get(peerId);
+      if (existing?.passwordLock) throw new Error('This chat already has a password. Use changeChatPassword().');
+      // Re-use the key of a chat whose password was removed earlier, so its sealed data stays readable.
+      const chatKey = existing?.chatKey ?? generateChatKey();
+      const passwordLock = await createPasswordLock(chatKey, password, peerKey);
+      this.#chats.set(peerId, { passwordLock, chatKey, sealedSessions: null });
+    });
+  }
+
+  /** Checks the chat password and unlocks the chat. Throws WrongPasswordError if it is wrong. */
+  async unlockChat(contactCode, password) {
+    const { peerId, peerKey } = await this.#peer(contactCode);
+    return this.#withLock(async () => {
+      const chat = this.#requirePasswordChat(peerId);
+      // The password is checked even if the chat is already unlocked, so the app can use this
+      // as the "enter chat password" check every time the user opens the chat.
+      const chatKey = await openPasswordLock(chat.passwordLock, password, peerKey);
+      if (chat.chatKey !== null) {
+        chatKey.fill(0);
+        return;
+      }
+      await this.#unseal(peerId, peerKey, chat, chatKey);
+    });
+  }
+
+  /** Locks a chat: its keys are encrypted and wiped from memory until unlockChat(). */
+  async lockChat(contactCode) {
+    const { peerId, peerKey } = await this.#peer(contactCode);
+    return this.#withLock(() => this.#lock(peerId, peerKey, this.#requirePasswordChat(peerId)));
+  }
+
+  /** Locks every chat that has a chat password, e.g. when the app goes to the background. */
+  async lockAllChats() {
+    return this.#withLock(async () => {
+      for (const [peerId, chat] of this.#chats) {
+        if (chat.passwordLock) await this.#lock(peerId, fromBase64(peerId), chat);
+      }
+    });
+  }
+
+  /** Changes a chat's password. The chat stays locked or unlocked as it was. */
+  async changeChatPassword(contactCode, currentPassword, newPassword) {
+    validateChatPassword(newPassword);
+    const { peerId, peerKey } = await this.#peer(contactCode);
+    return this.#mutate(async () => {
+      const chat = this.#requirePasswordChat(peerId);
+      const chatKey = await openPasswordLock(chat.passwordLock, currentPassword, peerKey);
+      try {
+        chat.passwordLock = await createPasswordLock(chatKey, newPassword, peerKey);
+      } finally {
+        chatKey.fill(0);
+      }
+    });
+  }
+
+  /** Removes a chat's password (the current one is required). The chat is left unlocked. */
+  async removeChatPassword(contactCode, password) {
+    const { peerId, peerKey } = await this.#peer(contactCode);
+    return this.#mutate(async () => {
+      const chat = this.#requirePasswordChat(peerId);
+      const chatKey = await openPasswordLock(chat.passwordLock, password, peerKey);
+      if (chat.chatKey === null) await this.#unseal(peerId, peerKey, chat, chatKey);
+      else chatKey.fill(0);
+      chat.passwordLock = null;
+    });
+  }
+
+  async hasChatPassword(contactCode) {
+    const { peerId } = await this.#peer(contactCode);
+    return Boolean(this.#chats.get(peerId)?.passwordLock);
+  }
+
+  async isChatLocked(contactCode) {
+    const { peerId } = await this.#peer(contactCode);
+    return this.#isLocked(peerId);
+  }
+
+  /**
+   * Encrypts data the app stores locally for a password-protected chat (message history,
+   * drafts, contact nickname...) with that chat's key. Returns a base64 string. Only works
+   * while the chat is unlocked, and only openChatData for the same chat can read it back.
+   */
+  async sealChatData(contactCode, text) {
+    const { peerId, peerKey } = await this.#peer(contactCode);
+    const bytes = utf8ToBytes(text);
+    return this.#withLock(async () => toBase64(await sealForChat(this.#requireChatKey(peerId), 'data', peerKey, bytes)));
+  }
+
+  /** Reverses sealChatData. Throws ChatLockedError while locked, DecryptionError if altered. */
+  async openChatData(contactCode, sealed) {
+    const { peerId, peerKey } = await this.#peer(contactCode);
+    const bytes = fromBase64(sealed);
+    return this.#withLock(async () => bytesToUtf8(await openForChat(this.#requireChatKey(peerId), 'data', peerKey, bytes)));
   }
 
   // --- Account recovery -------------------------------------------------------
@@ -360,61 +597,53 @@ export class Account {
   // --- Persistence --------------------------------------------------------------
 
   /**
-   * Returns the full private state as a JSON-safe object. It contains private keys: store it
-   * only on the device, encrypted (OS keychain / Keystore, or a key derived from the user's
-   * password). Save it after every encrypt/decrypt call, before sending or showing the message.
+   * Creates a random 256-bit storage key (base64). Create it once per device and keep it in the
+   * platform's secure key store (iOS Keychain, Android Keystore). Never upload it.
    */
-  async exportState() {
-    return this.#withLock(async () => ({
-      version: STATE_VERSION,
-      identity: {
-        signing: keyPairToJSON(this.#identity.signing),
-        dh: keyPairToJSON(this.#identity.dh),
-        binding: toBase64(this.#identity.binding),
-      },
-      signedPreKeys: [...this.#signedPreKeys.values()].map((spk) => ({
-        id: spk.id,
-        keyPair: keyPairToJSON(spk.keyPair),
-        signature: toBase64(spk.signature),
-        createdAt: spk.createdAt,
-      })),
-      currentSignedPreKeyId: this.#currentSignedPreKeyId,
-      oneTimePreKeys: [...this.#oneTimePreKeys].map(([id, keyPair]) => ({ id, keyPair: keyPairToJSON(keyPair) })),
-      nextPreKeyId: this.#nextPreKeyId,
-      nextSignedPreKeyId: this.#nextSignedPreKeyId,
-      sessions: [...this.#sessions].map(([peerId, list]) => ({ peerId, sessions: list.map((s) => s.toJSON()) })),
-    }));
+  static generateStorageKey() {
+    return generateStorageKey();
   }
 
-  static async importState(state) {
-    if (state?.version !== STATE_VERSION) throw new TypeError('Unsupported account state version');
-    const identity = {
-      signing: keyPairFromJSON(state.identity.signing),
-      dh: keyPairFromJSON(state.identity.dh),
-      binding: fromBase64(state.identity.binding, 64),
-    };
-    const bindingOk = await verifyIdentityBinding({
-      signingKey: identity.signing.publicKey,
-      dhKey: identity.dh.publicKey,
-      binding: identity.binding,
+  /**
+   * Turns on automatic saving. From now on, every call that changes the private state
+   * (encrypt, decrypt, startSession, createPreKeyUpload, chat password changes, deleteChat)
+   * awaits `save(blob)` before it returns. That guarantees:
+   *   - an envelope is only handed out for sending after the state that produced it is saved,
+   *   - a decrypted message is only returned after the state that consumed its key is saved.
+   * If `save` throws, the call is undone in memory and rejects with PersistenceError, so it can
+   * simply be retried (for decrypt: with the same envelope). The current state is saved once
+   * right away.
+   * `blob` is an encrypted base64 string; store it as-is and load it with Account.importState().
+   */
+  async enableAutoSave({ storageKey, save }) {
+    parseStorageKey(storageKey).fill(0);
+    if (typeof save !== 'function') throw new TypeError('save must be a function');
+    return this.#withLock(async () => {
+      await save(await sealState(await this.#snapshot(), storageKey));
+      this.#autoSave = { storageKey, save };
     });
-    if (!bindingOk) throw new TypeError('Account state is corrupted (identity binding is invalid)');
+  }
 
-    return new Account({
-      identity,
-      contactCode: await encodeContactCode(identity.signing.publicKey),
-      signedPreKeys: new Map(
-        state.signedPreKeys.map((spk) => [
-          spk.id,
-          { id: spk.id, keyPair: keyPairFromJSON(spk.keyPair), signature: fromBase64(spk.signature, 64), createdAt: spk.createdAt },
-        ]),
-      ),
-      currentSignedPreKeyId: state.currentSignedPreKeyId,
-      oneTimePreKeys: new Map(state.oneTimePreKeys.map(({ id, keyPair }) => [id, keyPairFromJSON(keyPair)])),
-      nextPreKeyId: state.nextPreKeyId,
-      nextSignedPreKeyId: state.nextSignedPreKeyId,
-      sessions: new Map(state.sessions.map(({ peerId, sessions }) => [peerId, sessions.map((s) => RatchetSession.fromJSON(s))])),
-    });
+  disableAutoSave() {
+    this.#autoSave = null;
+  }
+
+  /**
+   * Returns the full private state encrypted with `storageKey` (a base64 string). Chats with a
+   * chat password stay encrypted inside it with their own chat key, even while unlocked.
+   */
+  async exportState(storageKey) {
+    parseStorageKey(storageKey).fill(0);
+    return this.#withLock(async () => sealState(await this.#snapshot(), storageKey));
+  }
+
+  /**
+   * Loads a blob from exportState() or auto-save. Every field is validated (keys must match,
+   * signatures must verify, numbers must be in range); anything wrong throws InvalidStateError.
+   * Password-protected chats start locked.
+   */
+  static async importState(blob, storageKey) {
+    return Account.#fromSnapshot(await openState(blob, storageKey));
   }
 
   // --- Internals ----------------------------------------------------------------
@@ -426,12 +655,284 @@ export class Account {
     return result;
   }
 
+  /**
+   * Runs an operation that changes persisted state. With auto-save on, the state is saved
+   * before the result is returned; if the operation or the save fails, all in-memory changes
+   * are rolled back.
+   */
+  #mutate(operation) {
+    return this.#withLock(async () => {
+      // Read once: disableAutoSave() may run while the operation is awaiting.
+      const autoSave = this.#autoSave;
+      if (!autoSave) return operation();
+      const before = this.#captureMemory();
+      let result;
+      try {
+        result = await operation();
+      } catch (error) {
+        this.#restoreMemory(before);
+        throw error;
+      }
+      try {
+        await autoSave.save(await sealState(await this.#snapshot(), autoSave.storageKey));
+      } catch (error) {
+        this.#restoreMemory(before);
+        throw new PersistenceError('Saving the account state failed, so the operation was undone. It can be retried.', {
+          cause: error,
+        });
+      }
+      return result;
+    });
+  }
+
+  #captureMemory() {
+    return {
+      signedPreKeys: structuredClone(this.#signedPreKeys),
+      currentSignedPreKeyId: this.#currentSignedPreKeyId,
+      oneTimePreKeys: structuredClone(this.#oneTimePreKeys),
+      nextPreKeyId: this.#nextPreKeyId,
+      nextSignedPreKeyId: this.#nextSignedPreKeyId,
+      sessions: [...this.#sessions].map(([peerId, list]) => [peerId, list.map((s) => s.toJSON())]),
+      chats: structuredClone(this.#chats),
+    };
+  }
+
+  #restoreMemory(captured) {
+    this.#signedPreKeys = captured.signedPreKeys;
+    this.#currentSignedPreKeyId = captured.currentSignedPreKeyId;
+    this.#oneTimePreKeys = captured.oneTimePreKeys;
+    this.#nextPreKeyId = captured.nextPreKeyId;
+    this.#nextSignedPreKeyId = captured.nextSignedPreKeyId;
+    this.#sessions = new Map(captured.sessions.map(([peerId, list]) => [peerId, list.map((s) => RatchetSession.fromJSON(s))]));
+    this.#chats = captured.chats;
+  }
+
+  /** The private state as a JSON-safe object. Only ever leaves this class encrypted. */
+  async #snapshot() {
+    const chats = [];
+    for (const [peerId, chat] of this.#chats) {
+      if (chat.passwordLock) {
+        const sealed = chat.chatKey === null ? chat.sealedSessions : await this.#sealSessions(peerId, fromBase64(peerId), chat.chatKey);
+        chats.push({
+          peerId,
+          passwordLock: {
+            salt: toBase64(chat.passwordLock.salt),
+            iterations: chat.passwordLock.iterations,
+            wrappedKey: toBase64(chat.passwordLock.wrappedKey),
+          },
+          sealedSessions: sealed === null ? null : toBase64(sealed),
+        });
+      } else {
+        // Password was removed; the key is kept so data sealed earlier stays readable.
+        chats.push({ peerId, chatKey: toBase64(chat.chatKey) });
+      }
+    }
+    return {
+      version: STATE_VERSION,
+      identity: {
+        signing: keyPairToJSON(this.#identity.signing),
+        dh: keyPairToJSON(this.#identity.dh),
+        binding: toBase64(this.#identity.binding),
+      },
+      signedPreKeys: [...this.#signedPreKeys.values()].map((spk) => ({
+        id: spk.id,
+        keyPair: keyPairToJSON(spk.keyPair),
+        signature: toBase64(spk.signature),
+        createdAt: spk.createdAt,
+        usedBaseKeys: [...spk.usedBaseKeys],
+      })),
+      currentSignedPreKeyId: this.#currentSignedPreKeyId,
+      oneTimePreKeys: [...this.#oneTimePreKeys].map(([id, keyPair]) => ({ id, keyPair: keyPairToJSON(keyPair) })),
+      nextPreKeyId: this.#nextPreKeyId,
+      nextSignedPreKeyId: this.#nextSignedPreKeyId,
+      sessions: [...this.#sessions]
+        .filter(([peerId]) => !this.#chats.get(peerId)?.passwordLock)
+        .map(([peerId, list]) => ({ peerId, sessions: list.map((s) => s.toJSON()) })),
+      chats,
+    };
+  }
+
+  /** Builds an Account from a snapshot, validating every field. */
+  static async #fromSnapshot(state) {
+    expectObject(state, 'state');
+    if (state.version !== STATE_VERSION) invalidState('state.version', `unsupported version ${state.version}`);
+
+    // Identity: public keys must match the private keys, and the binding signature must verify.
+    expectObject(state.identity, 'identity');
+    const identity = {
+      signing: expectKeyPair(state.identity.signing, 'identity.signing'),
+      dh: expectKeyPair(state.identity.dh, 'identity.dh'),
+      binding: expectBytes(state.identity.binding, 'identity.binding', 64),
+    };
+    const signingCheck = await ed25519KeyPairFromSeed(identity.signing.privateKey);
+    if (!bytesEqual(signingCheck.publicKey, identity.signing.publicKey)) invalidState('identity.signing', 'keys do not match');
+    const dhCheck = await x25519KeyPairFromSeed(identity.dh.privateKey);
+    if (!bytesEqual(dhCheck.publicKey, identity.dh.publicKey)) invalidState('identity.dh', 'keys do not match');
+    const bindingOk = await verifyIdentityBinding({
+      signingKey: identity.signing.publicKey,
+      dhKey: identity.dh.publicKey,
+      binding: identity.binding,
+    });
+    if (!bindingOk) invalidState('identity.binding', 'signature does not verify');
+
+    // Signed prekeys: keys must match and be signed by the identity.
+    const signedPreKeys = new Map();
+    for (const [i, raw] of expectArray(state.signedPreKeys, 'signedPreKeys', MAX_SIGNED_PREKEYS_KEPT).entries()) {
+      const path = `signedPreKeys[${i}]`;
+      expectObject(raw, path);
+      const id = expectInt(raw.id, `${path}.id`, 1, MAX_PREKEY_ID);
+      if (signedPreKeys.has(id)) invalidState(`${path}.id`, 'duplicate id');
+      const keyPair = expectKeyPair(raw.keyPair, `${path}.keyPair`);
+      const signature = expectBytes(raw.signature, `${path}.signature`, 64);
+      if (!bytesEqual((await x25519KeyPairFromSeed(keyPair.privateKey)).publicKey, keyPair.publicKey)) {
+        invalidState(`${path}.keyPair`, 'keys do not match');
+      }
+      if (!(await verifySignedPreKey(identity.signing.publicKey, id, keyPair.publicKey, signature))) {
+        invalidState(`${path}.signature`, 'signature does not verify');
+      }
+      const usedBaseKeys = new Set(
+        expectArray(raw.usedBaseKeys, `${path}.usedBaseKeys`, MAX_BASE_KEYS_PER_SIGNED_PREKEY).map((key, j) => {
+          expectBytes(key, `${path}.usedBaseKeys[${j}]`, 32);
+          return key;
+        }),
+      );
+      const createdAt = expectInt(raw.createdAt, `${path}.createdAt`, 0, Number.MAX_SAFE_INTEGER);
+      signedPreKeys.set(id, { id, keyPair, signature, createdAt, usedBaseKeys });
+    }
+    let currentSignedPreKeyId = null;
+    if (state.currentSignedPreKeyId !== null) {
+      currentSignedPreKeyId = expectInt(state.currentSignedPreKeyId, 'currentSignedPreKeyId', 1, MAX_PREKEY_ID);
+      if (!signedPreKeys.has(currentSignedPreKeyId)) invalidState('currentSignedPreKeyId', 'no such signed prekey');
+    }
+
+    const oneTimePreKeys = new Map();
+    for (const [i, raw] of expectArray(state.oneTimePreKeys, 'oneTimePreKeys', MAX_ONE_TIME_PREKEYS_HELD).entries()) {
+      expectObject(raw, `oneTimePreKeys[${i}]`);
+      const id = expectInt(raw.id, `oneTimePreKeys[${i}].id`, 1, MAX_PREKEY_ID);
+      if (oneTimePreKeys.has(id)) invalidState(`oneTimePreKeys[${i}].id`, 'duplicate id');
+      oneTimePreKeys.set(id, expectKeyPair(raw.keyPair, `oneTimePreKeys[${i}].keyPair`));
+    }
+
+    const expectPeerId = (value, path) => {
+      expectBytes(value, path, 32);
+      return value;
+    };
+
+    const chats = new Map();
+    for (const [i, raw] of expectArray(state.chats, 'chats').entries()) {
+      const path = `chats[${i}]`;
+      expectObject(raw, path);
+      const peerId = expectPeerId(raw.peerId, `${path}.peerId`);
+      if (chats.has(peerId)) invalidState(`${path}.peerId`, 'duplicate chat');
+      if (raw.passwordLock) {
+        expectObject(raw.passwordLock, `${path}.passwordLock`);
+        chats.set(peerId, {
+          passwordLock: {
+            salt: expectBytes(raw.passwordLock.salt, `${path}.passwordLock.salt`, 16),
+            iterations: expectInt(raw.passwordLock.iterations, `${path}.passwordLock.iterations`, MIN_PBKDF2_ITERATIONS, MAX_PBKDF2_ITERATIONS),
+            wrappedKey: expectBytes(raw.passwordLock.wrappedKey, `${path}.passwordLock.wrappedKey`, 60),
+          },
+          chatKey: null, // every password-protected chat starts locked
+          sealedSessions: expectNullableBytes(raw.sealedSessions, `${path}.sealedSessions`),
+        });
+      } else {
+        chats.set(peerId, { passwordLock: null, chatKey: expectBytes(raw.chatKey, `${path}.chatKey`, 32), sealedSessions: null });
+      }
+    }
+
+    const sessions = new Map();
+    for (const [i, raw] of expectArray(state.sessions, 'sessions').entries()) {
+      const path = `sessions[${i}]`;
+      expectObject(raw, path);
+      const peerId = expectPeerId(raw.peerId, `${path}.peerId`);
+      if (sessions.has(peerId)) invalidState(`${path}.peerId`, 'duplicate contact');
+      if (chats.get(peerId)?.passwordLock) invalidState(`${path}.peerId`, 'password-protected chat stored in the clear');
+      const list = expectArray(raw.sessions, `${path}.sessions`, MAX_SESSIONS_PER_CONTACT);
+      sessions.set(peerId, list.map((s, j) => RatchetSession.fromJSON(s, `${path}.sessions[${j}]`)));
+    }
+
+    return new Account({
+      identity,
+      contactCode: await encodeContactCode(identity.signing.publicKey),
+      signedPreKeys,
+      currentSignedPreKeyId,
+      oneTimePreKeys,
+      nextPreKeyId: expectInt(state.nextPreKeyId, 'nextPreKeyId', 1, MAX_PREKEY_ID),
+      nextSignedPreKeyId: expectInt(state.nextSignedPreKeyId, 'nextSignedPreKeyId', 1, MAX_PREKEY_ID),
+      sessions,
+      chats,
+    });
+  }
+
+  async #peer(contactCode) {
+    const peerKey = await decodeContactCode(contactCode);
+    return { peerKey, peerId: toBase64(peerKey) };
+  }
+
   #publicIdentity() {
     return {
       identityKey: toBase64(this.#identity.signing.publicKey),
       identityDHKey: toBase64(this.#identity.dh.publicKey),
       identityBinding: toBase64(this.#identity.binding),
     };
+  }
+
+  #signedPreKeyRotationDue() {
+    const spk = this.#signedPreKeys.get(this.#currentSignedPreKeyId);
+    if (!spk) return true;
+    return (
+      Date.now() - spk.createdAt >= SIGNED_PREKEY_ROTATION_INTERVAL_MS ||
+      spk.usedBaseKeys.size >= SIGNED_PREKEY_ROTATION_AFTER_SESSIONS
+    );
+  }
+
+  #isLocked(peerId) {
+    const chat = this.#chats.get(peerId);
+    return Boolean(chat?.passwordLock && chat.chatKey === null);
+  }
+
+  #assertUnlocked(peerId) {
+    if (this.#isLocked(peerId)) throw new ChatLockedError();
+  }
+
+  #requirePasswordChat(peerId) {
+    const chat = this.#chats.get(peerId);
+    if (!chat?.passwordLock) throw new Error('This chat has no chat password');
+    return chat;
+  }
+
+  #requireChatKey(peerId) {
+    const chat = this.#chats.get(peerId);
+    if (!chat) throw new Error('This chat has no chat password, so it has no key to seal data with');
+    if (chat.chatKey === null) throw new ChatLockedError();
+    return chat.chatKey;
+  }
+
+  async #sealSessions(peerId, peerKey, chatKey) {
+    const sessions = this.#sessions.get(peerId) ?? [];
+    if (sessions.length === 0) return null;
+    const json = JSON.stringify(sessions.map((s) => s.toJSON()));
+    return sealForChat(chatKey, 'sessions', peerKey, utf8ToBytes(json));
+  }
+
+  async #lock(peerId, peerKey, chat) {
+    if (chat.chatKey === null) return;
+    chat.sealedSessions = await this.#sealSessions(peerId, peerKey, chat.chatKey);
+    this.#sessions.delete(peerId);
+    chat.chatKey.fill(0);
+    chat.chatKey = null;
+  }
+
+  async #unseal(peerId, peerKey, chat, chatKey) {
+    if (chat.sealedSessions !== null) {
+      const json = JSON.parse(bytesToUtf8(await openForChat(chatKey, 'sessions', peerKey, chat.sealedSessions)));
+      this.#sessions.set(
+        peerId,
+        json.map((s, i) => RatchetSession.fromJSON(s, `chat sessions[${i}]`)),
+      );
+    }
+    chat.chatKey = chatKey;
+    chat.sealedSessions = null;
   }
 
   /** Makes `session` the current session for this contact, keeping a few older ones. */
@@ -442,9 +943,9 @@ export class Account {
   }
 
   async #decryptWith(peerId, session, message) {
-    const padded = await session.decrypt(message.header, message.ciphertext);
+    const text = await session.decrypt(message.header, message.ciphertext, decodeMessage);
     this.#installSession(peerId, session);
-    return bytesToUtf8(unpad(padded));
+    return text;
   }
 
   /** First message from someone: run the responder side of X3DH. */
@@ -459,6 +960,17 @@ export class Account {
 
     const signedPreKey = this.#signedPreKeys.get(preKey.signedPreKeyId);
     if (!signedPreKey) throw new DecryptionError('Unknown signed prekey (it may have been rotated out)');
+
+    // Replay protection: each first message (identified by its ephemeral key) is accepted once
+    // per signed prekey, for as long as that signed prekey exists.
+    const baseKeyId = toBase64(preKey.ephemeralKey);
+    if (signedPreKey.usedBaseKeys.has(baseKeyId)) {
+      throw new DecryptionError('This first message was already received before (replay)');
+    }
+    if (signedPreKey.usedBaseKeys.size >= MAX_BASE_KEYS_PER_SIGNED_PREKEY) {
+      throw new DecryptionError('Too many new conversations on this signed prekey; rotate it with createPreKeyUpload()');
+    }
+
     let oneTimePreKey = null;
     if (preKey.oneTimePreKeyId !== null) {
       oneTimePreKey = this.#oneTimePreKeys.get(preKey.oneTimePreKeyId);
@@ -480,13 +992,14 @@ export class Account {
       baseKey: preKey.ephemeralKey,
     });
 
-    const padded = await session.decrypt(message.header, message.ciphertext);
-    // Only after the message authenticated: burn the one-time prekey and keep the session.
+    const text = await session.decrypt(message.header, message.ciphertext, decodeMessage);
+    // Only after the message authenticated and decoded: remember it, burn the one-time prekey, keep the session.
+    signedPreKey.usedBaseKeys.add(baseKeyId);
     if (oneTimePreKey) {
       oneTimePreKey.privateKey.fill(0);
       this.#oneTimePreKeys.delete(preKey.oneTimePreKeyId);
     }
     this.#installSession(peerId, session);
-    return bytesToUtf8(unpad(padded));
+    return text;
   }
 }

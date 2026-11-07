@@ -67,7 +67,6 @@ router.post("/challenge", (req, res) => {
     });
 });
 
-
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 
@@ -137,14 +136,16 @@ router.post("/upload", async (req, res) => {
         bundle,
         contactCode,
         challenge,
-        proof
+        proof,
+        resetPreKeys = false
     } = req.body || {};
 
     if (!validUpload(bundle) ||
         typeof contactCode !== "string" ||
         contactCode.length > 100 ||
         !isB64(challenge, 32) ||
-        !isB64(proof, 64)) {
+        !isB64(proof, 64) ||
+        typeof resetPreKeys !== "boolean") {
         return res.status(400).json({
             error: "Invalid public key upload"
         });
@@ -202,6 +203,21 @@ router.post("/upload", async (req, res) => {
             throw err;
         }
 
+        // Public identity must match the key registered with the account.
+        const owner = db.prepare(`
+            SELECT public_key
+            FROM users
+            WHERE id = ?
+        `).get(req.user.id);
+
+        if (!owner || owner.public_key !== bundle.identityKey) {
+            const err = new Error(
+                "Public identity does not match registered account"
+            );
+            err.httpStatus = 409;
+            throw err;
+        }
+
         const existing = db.prepare(`
             SELECT contact_code, identity_key, identity_dh_key,
                    identity_binding, signed_prekey_id,
@@ -211,18 +227,43 @@ router.post("/upload", async (req, res) => {
         `).get(req.user.id);
 
         if (existing) {
+            // Rotating a signed prekey must never change the long-term identity.
             if (existing.contact_code !== normalized ||
                 existing.identity_key !== bundle.identityKey ||
                 existing.identity_dh_key !== bundle.identityDHKey ||
-                existing.identity_binding !== bundle.identityBinding ||
-                existing.signed_prekey_id !== bundle.signedPreKey.id ||
-                existing.signed_prekey_public !== bundle.signedPreKey.publicKey ||
-                existing.signed_prekey_signature !== bundle.signedPreKey.signature) {
+                existing.identity_binding !== bundle.identityBinding) {
                 const err = new Error(
-                    "Identity or signed-prekey change needs a separate rotation process"
+                    "Identity change is not allowed"
                 );
                 err.httpStatus = 409;
                 throw err;
+            }
+
+            if (existing.signed_prekey_id === bundle.signedPreKey.id) {
+                // An existing ID cannot be reused for different key material.
+                if (existing.signed_prekey_public !== bundle.signedPreKey.publicKey ||
+                    existing.signed_prekey_signature !== bundle.signedPreKey.signature) {
+                    const err = new Error(
+                        "Cannot replace a signed prekey without changing its ID"
+                    );
+                    err.httpStatus = 409;
+                    throw err;
+                }
+            } else {
+                // The new signed-prekey signature was verified above.
+                // Old private signed prekeys remain on the client's device.
+                db.prepare(`
+                    UPDATE user_crypto
+                    SET signed_prekey_id = ?,
+                        signed_prekey_public = ?,
+                        signed_prekey_signature = ?
+                    WHERE user_id = ?
+                `).run(
+                    bundle.signedPreKey.id,
+                    bundle.signedPreKey.publicKey,
+                    bundle.signedPreKey.signature,
+                    req.user.id
+                );
             }
         } else {
             db.prepare(`
@@ -243,6 +284,16 @@ router.post("/upload", async (req, res) => {
                 bundle.signedPreKey.publicKey,
                 bundle.signedPreKey.signature
             );
+        }
+
+        // Recovery creates new private prekeys.
+        // Remove obsolete server-side one-time prekeys only when
+        // the authenticated client explicitly requests a reset.
+        if (resetPreKeys) {
+            db.prepare(`
+                DELETE FROM one_time_prekeys
+                WHERE user_id = ?
+            `).run(req.user.id);
         }
 
         const insert = db.prepare(`
@@ -272,7 +323,9 @@ router.post("/upload", async (req, res) => {
         });
 
     } catch (error) {
-        if (inTransaction) db.exec("ROLLBACK");
+        if (inTransaction) {
+            db.exec("ROLLBACK");
+        }
 
         if (error.httpStatus) {
             return res.status(error.httpStatus).json({
@@ -302,7 +355,7 @@ router.post("/upload", async (req, res) => {
     }
 });
 
-
+// Return an authenticated contact's current public X3DH bundle.
 router.post("/bundle", async (req, res) => {
     const { contactCode } = req.body || {};
 

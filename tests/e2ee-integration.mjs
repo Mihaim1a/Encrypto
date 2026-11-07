@@ -229,13 +229,16 @@ async function main() {
 
     console.log("11. Exporting Alice and Bob's cryptographic states...");
 
-    const aliceState = await alice.account.exportState();
-    const bobState = await bob.account.exportState();
+    const aliceStorageKey = Account.generateStorageKey();
+    const bobStorageKey = Account.generateStorageKey();
+
+    const aliceState = await alice.account.exportState(aliceStorageKey);
+    const bobState = await bob.account.exportState(bobStorageKey);
 
     console.log("12. Restoring both accounts...");
 
-    const aliceRestored = await Account.importState(aliceState);
-    const bobRestored = await Account.importState(bobState);
+    const aliceRestored = await Account.importState(aliceState, aliceStorageKey);
+    const bobRestored = await Account.importState(bobState, bobStorageKey);
 
     assert.equal(
         aliceRestored.contactCode,
