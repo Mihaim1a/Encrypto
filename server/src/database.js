@@ -255,4 +255,21 @@ for (const message of oldMessages) {
 
 console.log("Encrypto message retention schema ready!");
 
+// Keep a permanent record of published signed-prekey IDs.
+db.exec(`
+    CREATE TABLE IF NOT EXISTS signed_prekey_history (
+        user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        key_id INTEGER NOT NULL,
+        published_at INTEGER NOT NULL,
+        PRIMARY KEY (user_id, key_id)
+    );
+`);
+
+// Preserve the active key IDs from before this migration.
+db.prepare(`
+    INSERT OR IGNORE INTO signed_prekey_history
+        (user_id, key_id, published_at)
+    SELECT user_id, signed_prekey_id, ?
+    FROM user_crypto
+`).run(Date.now());
 module.exports = db;
