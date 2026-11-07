@@ -1,0 +1,19 @@
+{
+  "name": "encrypto-final-frontend",
+  "version": "2.1.1",
+  "private": true,
+  "description": "Encrypto frontend integrated with the provided backend and crypto module",
+  "scripts": {
+    "setup": "npm ci --prefix server",
+    "start": "npm run start --prefix server",
+    "test:ui": "node --test client/tests/*.test.mjs",
+    "test:crypto": "npm run test --prefix crypto",
+    "test:integration": "node --test tests/*.mjs",
+    "check": "npm run test:ui && npm run test:crypto",
+    "verify:running": "node scripts/verify-running.mjs",
+    "verify:source": "node scripts/verify-source.mjs"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

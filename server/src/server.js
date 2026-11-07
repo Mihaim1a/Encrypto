@@ -35,7 +35,21 @@ app.disable("x-powered-by");
 // Apply browser security headers.
 app.use(helmet({
     // Configure CSP after the frontend architecture is finalized.
-    contentSecurityPolicy: false,
+    contentSecurityPolicy: {
+        useDefaults: false,
+        directives: {
+            defaultSrc: ["'none'"],
+            scriptSrc: ["'self'"],
+            styleSrc: ["'self'"],
+            imgSrc: ["'self'", "data:"],
+            connectSrc: ["'self'"],
+            fontSrc: ["'self'"],
+            formAction: ["'self'"],
+            baseUri: ["'none'"],
+            objectSrc: ["'none'"],
+            frameAncestors: ["'none'"]
+        }
+    },
 
     // Avoid blocking resources needed during frontend integration.
     crossOriginEmbedderPolicy: false,
@@ -137,14 +151,21 @@ function runMaintenance() {
     }
 }
 
-const frontendFile = path.resolve(
-    __dirname,
-    "../../frontend.html"
-);
-
-// Serve the Encrypto website from the same origin as the API.
+// Frontend integration: serve the new modular interface from the same origin
+// as session cookies, WebSocket notifications and /client-crypto.
+const clientDir = path.resolve(__dirname, "../../client");
+app.use("/app", express.static(clientDir, {
+    dotfiles: "deny",
+    index: false,
+    setHeaders(res) { res.set("Cache-Control", "no-store"); }
+}));
+app.get(["/app", "/app/"], (req, res) => {
+    res.set("Cache-Control", "no-store");
+    res.redirect(302, "/");
+});
 app.get("/", (req, res) => {
-    res.sendFile(frontendFile);
+    res.set("Cache-Control", "no-store");
+    res.sendFile(path.join(clientDir, "index.html"));
 });
 
 // Create the HTTP server.
@@ -164,8 +185,20 @@ server.on("close", () => {
 });
 
 // Start Encrypto.
+server.on("error", (error) => {
+    if (error.code === "EADDRINUSE") {
+        console.error(`[Encrypto] Port ${PORT} is already occupied. An old Encrypto server may still be running.`);
+        console.error("[Encrypto] Stop the existing server before trying again; do not assume the old browser tab is serving this build.");
+    } else {
+        console.error("[Encrypto] Could not start server:", error.message);
+    }
+    process.exitCode = 1;
+});
+
 server.listen(PORT, "127.0.0.1", () => {
     console.log(`Server running on http://localhost:${PORT}`);
+    console.log("[Encrypto] Serving verified frontend v2.1.1 from client/index.html");
+    console.log("[Encrypto] Open ONLY http://localhost:3000 (not legacy HTML or port 4173)");
 
     runMaintenance();
 
