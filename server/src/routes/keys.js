@@ -226,6 +226,26 @@ router.post("/upload", async (req, res) => {
             WHERE user_id = ?
         `).get(req.user.id);
 
+        // Reject previously published signed-prekey IDs.
+        // Recovery may generate random IDs, so do not compare numerically.
+        const isCurrentPreKey = existing &&
+            existing.signed_prekey_id === bundle.signedPreKey.id;
+
+        if (!isCurrentPreKey) {
+            const previouslyPublished = db.prepare(`
+                SELECT 1 AS used
+                FROM signed_prekey_history
+                WHERE user_id = ? AND key_id = ?
+            `).get(req.user.id, bundle.signedPreKey.id);
+
+            if (previouslyPublished) {
+                const err = new Error(
+                    "Previously published signed prekey cannot be reused"
+                );
+                err.httpStatus = 409;
+                throw err;
+            }
+        }
         if (existing) {
             // Rotating a signed prekey must never change the long-term identity.
             if (existing.contact_code !== normalized ||
@@ -289,6 +309,18 @@ router.post("/upload", async (req, res) => {
         // Recovery creates new private prekeys.
         // Remove obsolete server-side one-time prekeys only when
         // the authenticated client explicitly requests a reset.
+        // Store newly published key IDs in the same transaction.
+        if (!isCurrentPreKey) {
+            db.prepare(`
+                INSERT INTO signed_prekey_history
+                    (user_id, key_id, published_at)
+                VALUES (?, ?, ?)
+            `).run(
+                req.user.id,
+                bundle.signedPreKey.id,
+                Date.now()
+            );
+        }
         if (resetPreKeys) {
             db.prepare(`
                 DELETE FROM one_time_prekeys
