@@ -1,0 +1,36 @@
+/* Small, intentional additions to the existing Encrypto design language.
+   Original color palette, typography, message bubbles and responsive behavior remain. */
+.side-top { padding-bottom: 5px; }
+/* Only the account details should grow; never stretch the avatar. */
+.account-tile > .account-title { display:flex; flex-direction:column; flex:1 1 auto; gap:5px; min-width:0; }
+.account-tile > .avatar { flex:0 0 42px; width:42px; height:42px; min-width:42px; display:inline-grid; place-items:center; }
+.account-tile strong{font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.account-tile small{color:var(--muted);font-size:10px}
+.side-main-actions{margin-bottom:11px}.side-main-actions .btn{padding:12px}
+.side-nav{display:flex;flex-direction:column;gap:3px;margin-top:10px}
+.side-list{padding-top:10px}
+.side-list-head{color:var(--muted);font-size:10px;letter-spacing:.1em;font-weight:800;display:flex;justify-content:space-between;align-items:center;padding:4px 14px 9px}
+.side-list-head span:last-child{color:var(--text);background:var(--panel-3);font-size:10px;letter-spacing:0;padding:3px 7px;border-radius:5px}
+.side-chat{width:100%;display:flex;gap:11px;align-items:center;border:1px solid transparent;border-radius:11px;padding:12px 9px;background:none;color:var(--text);text-align:left;margin:2px 0}
+.side-chat:hover,.side-chat.selected{background:var(--panel-2)}.side-chat.selected{border-color:var(--border)}
+.side-chat-body{display:flex;flex:1;min-width:0;flex-direction:column;gap:7px}
+.side-chat-top,.side-chat-bottom{display:flex;align-items:center;justify-content:space-between;gap:7px;min-width:0}
+.side-chat-top strong{font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
+.side-chat-top small{font-size:10px;color:var(--muted2)}
+.side-chat-preview{font-size:11px;color:var(--muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:190px;display:inline-flex;gap:5px;align-items:center}
+.code-display{font:12px/1.9 ui-monospace,SFMono-Regular,Consolas,monospace;overflow-wrap:anywhere;padding:15px;background:var(--panel-2);border:1px solid var(--border);border-radius:9px;margin:10px 0 18px;color:var(--text)}
+.small-mono{font:12px/1.75 ui-monospace,Consolas,monospace;word-break:break-all;background:var(--panel-2);padding:12px;border-radius:9px}
+.divider-line{height:1px;background:var(--border);margin:20px 0}
+.wide-input{display:block;width:100%;resize:vertical;color:var(--text);font-family:inherit}
+.recovery-display{font:12px/1.8 ui-monospace,Consolas,monospace;background:var(--panel-2)}
+.modal-field-label{font-size:12px;font-weight:700;display:block}
+.action-row{display:flex;gap:10px;justify-content:center;flex-wrap:wrap}
+.auth-card-scroll{padding:25px 0;max-height:95dvh;overflow-y:auto;scrollbar-width:thin}
+.field-hint{font-size:11px;color:var(--muted);line-height:1.6;margin:0}
+.side-list .empty-side{font-size:11px}
+.security-section{margin-top:20px}
+@media(max-width:720px){.side-list{padding-top:5px}.side-top{padding-top:15px}.side-brand{padding-bottom:14px}.auth-card-scroll{max-height:none;overflow:visible}.security-strip{justify-content:flex-start}.modal-card{overflow-y:auto}.side-chat-preview{max-width:200px}}
+
+/* Toast placement avoids covering the sidebar header controls, especially on mobile. */
+.toast-slot{top:auto;bottom:68px;right:18px}
+@media(max-width:720px){.toast-slot{top:auto;bottom:60px;right:10px;left:10px}.toast{max-width:100%;font-size:11px}}

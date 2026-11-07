@@ -1,0 +1,33 @@
+ENCRYPTO — FINAL FRONTEND RELEASE v2.1.1
+======================================
+This package contains the latest UI, the original supplied backend,
+and the supplied cryptography module. This is a local development build,
+not a security certification.
+
+1. EXTRACT this ZIP to a fresh folder. DO NOT overwrite or merge an older copy.
+2. Open a terminal INSIDE this folder (where package.json is located).
+3. Run:  npm run setup
+4. Run:  npm start
+5. Visit: http://localhost:3000
+6. Open another terminal in the same folder and run:
+       npm run verify:running
+   You must see five PASS lines, followed by v2.1.1.
+
+The browser tab title contains (v2.1.1). Settings -> About also shows
+"verified v2.1.1". The legacy HTML file was removed on purpose.
+
+Already have an old Encrypto window or server open?
+- Stop the OLD Encrypto process with Ctrl+C in its terminal.
+- Close old tabs, restart from THIS folder, then force refresh (Ctrl+Shift+R
+  on Windows/Linux or Cmd+Shift+R on macOS).
+- If port 3000 is occupied, DO NOT assume the new app is running.
+- Do not open index.html directly; always use http://localhost:3000.
+
+For a visual tour, click "Explore interactive demo". This is a simulation,
+NOT encrypted chat. The live mode requires the backend and crypto module.
+
+Check code/test suite: npm run check
+
+Unsupported in the supplied backend/crypto: shared four-digit PIN,
+secure group messaging, custom expiring-message protocol, and screenshot
+prevention. These are NOT simulated as secure features.
