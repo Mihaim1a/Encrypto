@@ -13,6 +13,7 @@ All encryption and decryption happens on the device. The server stores and relay
 The library has no dependencies. It uses the platform's native Web Crypto API (`crypto.subtle`), so it runs in **Node.js 20+, current browsers and Electron**.
 
 ```bash
+cd crypto
 npm test        # node --test
 npm run demo    # full walkthrough with a fake server
 ```
@@ -149,5 +150,5 @@ Issue a new challenge every time and accept each one once. After restoring, the 
 | `src/attachments.js` | Attachment encryption |
 | `src/primitives.js` | Web Crypto wrappers (X25519, Ed25519, HKDF, HMAC, PBKDF2, AES-256-GCM) |
 | `src/encoding.js` | base64 / base32 / UTF-8 helpers |
-| `test/protocol.test.js` | 30 tests: replay (incl. first messages), tampering, MITM, spoofing, reflection, invalid keys, skip limits, out-of-order, rotation, recovery, encrypted persistence and rollback, chat passwords |
+| `test/protocol.test.js` | 33 tests: replay (incl. first messages), tampering, MITM, spoofing, reflection, invalid keys, skip limits, out-of-order, rotation, recovery, encrypted persistence and rollback, chat passwords |
 | `examples/demo.js` | Walkthrough with a fake server |
